@@ -27,6 +27,8 @@
     <string name="oneios_last_return_inplace">The last session returned to One UI without a restart.</string>
     <string name="oneios_last_return_failsafe">The last session returned to One UI by restarting the phone: %1$s</string>
     <string name="oneios_last_return_reboot">The last session returned to One UI by a restart.</string>
+    <string name="oneios_back">Back to One UI</string>
+    <string name="oneios_back_line">An iOS session is still open. This ends it, as Volume Up + Volume Down for 3 seconds does.</string>
     <string name="oneios_remove">Remove the iOS files</string>
     <string name="oneios_remove_line">The runtime, the image set and iOS\'s own data on this phone</string>
     <string name="oneios_remove_confirm">Remove the OneiOS runtime, the iOS image set and everything iOS stored? The files you imported them from stay where they are.</string>

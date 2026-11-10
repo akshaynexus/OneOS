@@ -30,6 +30,9 @@ object OneiosRoot {
         SCRIPT("script", Stdin.DATA),
         FINISH("finish", Stdin.NONE),
         SWITCH("switch", Stdin.NONE),
+
+        /** Back to One UI: runs oneios_return.sh; nothing happens without an open session. */
+        RETURN("return", Stdin.NONE),
         REMOVE("remove", Stdin.SCRIPT),
     }
 
@@ -65,7 +68,7 @@ object OneiosRoot {
             args.getOrNull(i)?.let { if (!OneiosManifests.validPath(it)) p += "${verb.word}: '${it.take(40)}' is not a plain relative path" }
         }
         when (verb) {
-            Verb.STATUS, Verb.REMOVE -> need(0)
+            Verb.STATUS, Verb.REMOVE, Verb.RETURN -> need(0)
             Verb.BEGIN -> { need(1); kind(0) }
             Verb.RECEIVE -> {
                 need(5); kind(0); path(1); arg(2, DEC, "a size"); arg(3, HEX64, "a SHA-256")

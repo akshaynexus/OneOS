@@ -25,6 +25,9 @@
 #   switch <versionCode> <ack>  the preflight, then the session, detached, in
 #                               init's mount namespace (ack 1 = the
 #                               experimental tick)
+#   return                      Back to One UI: runs oneios_return.sh, detached,
+#                               in init's mount namespace. With no open session
+#                               that script does nothing
 #   remove                      delete the stage (never during a session)
 #
 # Writes: only under $STAGE (/data/local/tmp/oneios), which is root's, mode
@@ -316,6 +319,19 @@ do_switch() {
     say "@@OK switch"
 }
 
+do_return() {
+    [ $# -eq 0 ] || usage "return"
+    stage_ok
+    [ -f "$STAGE/oneios_return.sh" ] && mine "$STAGE/oneios_return.sh" || refuse "oneios_return.sh is not staged"
+    session_open || { say "@@OK return nothing"; return; }
+    [ -z "$T" ] || refuse "test root: a session is open, nothing was started"
+    find_bb
+    [ -n "$BB" ] || refuse "no busybox at the root manager's paths"
+    echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null
+    "$BB" nsenter -t 1 -m -- "$BB" setsid /system/bin/sh "$STAGE/oneios_return.sh" app </dev/null >>"$STAGE/return.log" 2>&1 &
+    say "@@OK return started"
+}
+
 do_remove() {
     [ $# -eq 0 ] || usage "remove"
     [ -e "$STAGE" ] || [ -L "$STAGE" ] || { say "@@OK remove nothing"; return; }
@@ -342,6 +358,7 @@ case "$verb" in
     script) do_script "$@" ;;
     finish) do_finish "$@" ;;
     switch) do_switch "$@" ;;
+    return) do_return "$@" ;;
     remove) do_remove "$@" ;;
-    *) usage "oneios_root.sh status|begin|receive|script|finish|switch|remove" ;;
+    *) usage "oneios_root.sh status|begin|receive|script|finish|switch|return|remove" ;;
 esac

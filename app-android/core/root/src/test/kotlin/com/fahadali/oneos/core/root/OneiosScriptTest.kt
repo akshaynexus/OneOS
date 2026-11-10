@@ -22,7 +22,8 @@ class OneiosScriptTest {
     private val returnScript = File(Shipped.switcherAssets, "oneios_return.sh")
 
     private val shells: List<String> =
-        (listOf("/bin/sh") + TestShell.available().map { it.path }).filter { File(it).canExecute() }.distinct()
+        // busybox is not a shell by its own name ("busybox sh"): the others are run as <shell> -c.
+        (listOf("/bin/sh") + TestShell.available().filterNot { it.appletsFirst }.map { it.path }).filter { File(it).canExecute() }.distinct()
 
     private val roots = mutableListOf<File>()
 
@@ -172,7 +173,19 @@ class OneiosScriptTest {
         // The test root never starts a session.
         assertRefused(f.verb(OneiosRoot.Verb.SWITCH, listOf("100", "1")), "nothing was started")
         assertRefused(f.verb(OneiosRoot.Verb.SWITCH, listOf("100", "0")), "experimental tick")
-        assertFalse(File(f.stage, "session").exists())
+        // Back to One UI with no open session does nothing.
+        val back = f.verb(OneiosRoot.Verb.RETURN)
+        assertOk(back)
+        assertEquals("return nothing", back.reply.ok)
+        // An open session of this boot: the test root starts nothing, and staging is refused.
+        File(f.stage, "session").mkdirs()
+        File(f.stage, "session/boot").writeText("boot-1\n")
+        File(f.stage, "session/state").writeText("running\n")
+        assertTrue(f.verb(OneiosRoot.Verb.STATUS).status.sessionOpen)
+        assertRefused(f.verb(OneiosRoot.Verb.RETURN), "a session is open")
+        assertRefused(f.verb(OneiosRoot.Verb.BEGIN, listOf("image")), "an iOS session is running")
+        assertRefused(f.verb(OneiosRoot.Verb.REMOVE), "an iOS session is running")
+        File(f.stage, "session").deleteRecursively()
         // What root recorded: every file with its hash, the manifest included.
         assertEquals(
             setOf("runtime.json", "bin/stub", "bin/xnuhost"),

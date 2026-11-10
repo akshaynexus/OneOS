@@ -45,6 +45,8 @@ Choose a system → **iOS 27 (OneiOS)** → Open (`OneiosActivity`, `OneiosJob`)
 - **iOS image set**: what is staged; *I have the file* (the system file picker). No download.
 - **Session**: *Ready to switch*, or the one line root's preflight gave (for example "no OneiOS runtime is staged:
   xnuhost, the program that runs iOS, comes with it"). How the last session returned.
+- *Back to One UI*, shown while a session is still open and the app runs (root's `return` verb starts
+  `oneios_return.sh`; with no open session it does nothing).
 - The experimental tick and **Switch to iOS 27**, enabled only with the tick and a passing preflight.
 - *Remove the iOS files*.
 
@@ -132,6 +134,27 @@ neither restarts anything.
   guards on the scripts' text.
 - `./gradlew :core:model:test :core:root:testDebugUnitTest`. The app itself needs the SESL9 libraries from
   GitHub Packages (a token in `~/.config/twidget/github.properties`), as before this change.
+
+## CI: the APK without a personal token
+
+`.github/workflows/oneios-apk.yml`, on every push to `oneios` and by hand (`gh workflow run oneios-apk.yml -R
+akshaynexus/OneOS --ref oneios`):
+
+1. Reads tribalfs' SESL9 and oneui-design packages with the run's own `GITHUB_TOKEN` (`permissions: packages:
+   read`), passed as `GH_PACKAGES_USER` / `GH_PACKAGES_TOKEN`, which `settings.gradle.kts` already takes. The first
+   step tries it on one file and prints GitHub's answer; if that is a refusal, it uses the optional repository
+   secret `GH_PACKAGES_TOKEN` (a token with `read:packages`) and says which one it used.
+2. Builds the in-guest app (`scripts/build-guest-manager.sh --debug`), runs the unit tests, and builds the normal
+   full edition: `:app:assembleFullDebug` with the default `oneos.packSets` (unset). That packs no package set:
+   the build records each set file's size and download source from `packages/remote.txt` and `sizes.txt`, and the
+   app downloads them by SHA-256. So upstream's `out/overlays*` folders are not needed, and the APK holds no OEM
+   file and no image.
+3. Uploads `OneOS-oneios-<version>-debug.apk` as an artifact and attaches it to the prerelease `oneios-<version>`
+   on the fork, recreated at the built commit each time.
+
+Each run signs with a debug key of its own unless the secret `ONEIOS_DEBUG_KEYSTORE_B64` (a base64 debug keystore)
+is set, so without it an earlier build has to be uninstalled before a new one installs. The in-guest app is a
+debug build too: Android guests that already hold upstream's release-signed one cannot take it as an update.
 
 ## Not done yet
 

@@ -137,6 +137,12 @@ class OneiosActivity : EdgeToEdgeActivity() {
             st.ready -> PrebootCards.row(session, getString(R.string.oneios_ready))
             else -> PrebootCards.row(session, getString(R.string.oneios_not_ready), st.notReady)
         }
+        // Back to One UI, while a session is still open and this app runs (the volume keys do the same).
+        if (st?.sessionOpen == true) {
+            PrebootCards.row(session, getString(R.string.oneios_back), getString(R.string.oneios_back_line), chevron = true, enabled = idle) {
+                OneiosJob.backToOneUi(this)
+            }
+        }
         when (st?.lastReturn) {
             "inplace" -> PrebootCards.row(session, getString(R.string.oneios_last_return_inplace))
             "failsafe" -> PrebootCards.row(session, getString(R.string.oneios_last_return_failsafe, st.lastReturnDetail.orEmpty()))

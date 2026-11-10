@@ -203,6 +203,12 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         "Switching to ${OneiosSystem.SHORT_NAME}…"
     }
 
+    /** Back to One UI, for a session that is still open while this app runs (one that never stopped One UI, or is stuck). */
+    fun backToOneUi(ctx: Context) = job(ctx, Phase.SWITCHING, "Returning to One UI…") { app ->
+        val r = must(root(app, OneiosRoot.Verb.RETURN))
+        if (r.reply.ok == "return nothing") "No iOS session is open." else "Returning to One UI. If it cannot be done in place, the phone restarts."
+    }
+
     fun remove(ctx: Context) = job(ctx, Phase.REMOVING, "Removing the iOS files…") { app ->
         must(root(app, OneiosRoot.Verb.REMOVE, silenceMs = 10 * 60_000L))
         File(app.cacheDir, "oneios").deleteRecursively()
