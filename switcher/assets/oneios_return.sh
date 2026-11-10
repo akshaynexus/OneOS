@@ -293,6 +293,25 @@ if [ -n "$left" ]; then
     done
 fi
 
+# The display helper (OneiOS's runtime/display; oneios_switch.sh starts it on
+# One UI's side and puts it in the session's cgroup, so it is usually gone by
+# here: it leaves when xnuhost's socket closes). Whatever is left of it is
+# asked once, given a second, then killed. A dead client's layers are
+# surfaceflinger's to drop, and the composer restart below takes the panel
+# back whatever it left: nothing of the return waits for it longer.
+end_display() {
+    for dp in $(cat "$CTL/display.pid" 2>/dev/null); do
+        is_ours "$dp" OneiOSDisplay || is_ours "$dp" oneios-display || continue
+        kill -TERM "$dp" 2>/dev/null
+        dn=0
+        while [ $dn -lt 5 ] && [ -d "$P/$dp" ]; do sleep 0.2; dn=$((dn + 1)); done
+        [ -d "$P/$dp" ] && kill -9 "$dp" 2>/dev/null
+    done
+    [ ! -s "$CTL/display.log" ] || say "display helper: $(tail -n 2 "$CTL/display.log" 2>/dev/null | tr '\n' '|' | cut -c1-300)"
+    return 0
+}
+end_display
+
 # The switch ended before it stopped One UI's zygote (it marks the stop):
 # One UI never went away, so there is nothing to check or start. Its helpers
 # end, and that is the whole return.

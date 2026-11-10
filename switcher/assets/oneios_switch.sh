@@ -136,6 +136,18 @@ reader_end() {
     [ "$OWN_GROUP" = 1 ] && kill -9 -- "-$$" 2>/dev/null
     exit 0
 }
+# The display helper (OneiOS's runtime/display, bin/oneios-display): a One
+# UI-side process that shows the guest's frames (session/display.sock) on a
+# surfaceflinger layer. Ended by its pid, never waited for: surfaceflinger
+# drops a dead client's layers, and the return restarts the composer anyway.
+end_display() {
+    for dp in $(cat "$CTL/display.pid" 2>/dev/null); do
+        case "$(tr '\0' ' ' 2>/dev/null < "$P/$dp/cmdline")" in
+            *OneiOSDisplay*|*oneios-display*) kill -9 "$dp" 2>/dev/null ;;
+        esac
+    done
+    return 0
+}
 # The reboot return without oneios_return.sh, for the watcher when that script
 # cannot be run or ends with an error: the same three steps as its failsafe.
 hard_reboot() { # <reason word> <why>
@@ -418,6 +430,8 @@ case "$MODE" in
         awake() { echo oneios_session 2>/dev/null > "$T/sys/power/wake_lock"; }
         go() {
             echo "$(date '+%F %T') watcher: $*; returning to One UI"
+            # The guest's picture goes first: nothing of the return waits for it.
+            end_display
             # Not exec: a return script that cannot be run (gone, damaged) or
             # that ends with an error must still end in One UI, by the reboot.
             # A return that hangs is its own guard's to end (oneios_return.sh).
@@ -694,6 +708,26 @@ echo "$XP" > "$CTL/xnuhost.pid"
 echo "$XNS" > "$CTL/mntns"
 echo running > "$CTL/state"
 echo "xnuhost: pid $XP in mount namespace $XNS, log $SESSION/xnuhost.log"
+
+# The guest's screen: the runtime's display helper, when it carries one. It
+# runs here, on One UI's side (it needs surfaceflinger's binder and the
+# framework's classes, which xnuhost's namespace is not for), as root, from
+# the runtime the preflight hashed. It waits for xnuhost's display.sock, shows
+# the frames on a top layer and leaves when the socket closes. It is in the
+# session's cgroup, so the return ends it with the rest, and by its pid
+# (control/, where the guest cannot write; its log is there too). Nothing
+# waits for it: without it the session runs with a dark screen.
+DH="$STAGE/runtime/bin/oneios-display"
+if [ -f "$DH" ] && [ ! -L "$DH" ] && [ -x "$DH" ] && root_only "$DH"; then
+    "$BB" setsid "$DH" --session "$SESSION" --takeover --wait 60 </dev/null >>"$CTL/display.log" 2>&1 &
+    DP=$!
+    echo "$DP" > "$CTL/display.pid"
+    echo 0 2>/dev/null > "/proc/$DP/oom_score_adj"
+    echo "$DP" 2>/dev/null > /sys/fs/cgroup/oneios_session/cgroup.procs
+    echo "Display helper: pid $DP, log $CTL/display.log"
+else
+    echo "Display helper: the runtime has none (bin/oneios-display); the guest's screen is not shown"
+fi
 
 echo "=== [5/5] $(date +%T) Session running ==="
 echo "Auto-return to One UI: when xnuhost ends, on $SESSION/return.request, or without $SESSION/ready after ${ONEIOS_RETURN_MAX:-600}s"
