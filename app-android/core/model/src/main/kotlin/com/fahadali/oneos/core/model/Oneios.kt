@@ -1,0 +1,734 @@
+package com.fahadali.oneos.core.model
+
+import java.io.EOFException
+import java.io.IOException
+import java.io.InputStream
+import java.security.MessageDigest
+import java.util.Locale
+
+/**
+ * The iOS 27 (OneiOS) system (docs/oneios.md): not an Android guest, so it is
+ * not an [ImageRef]. Three things differ:
+ *  - its runtime (xnuhost, the program that runs iOS on One UI's kernel) is a
+ *    package from OneiOS's GitHub releases ([OneiosReleases]);
+ *  - its image set is built by the user from Apple's firmware with OneiOS's
+ *    scripts and imported from a file, never downloaded ([OneiosKind.IMAGE]);
+ *  - its session is `oneios_switch.sh` / `oneios_return.sh`, in its own stage.
+ * Both the runtime package and the image set are a `.tar.zst` with a manifest
+ * of sizes and SHA-256s ([OneiosManifests], [OneiosPackage]).
+ */
+object OneiosSystem {
+    const val ID = "oneios-ios27"
+
+    /** The system's name on its card and in every text about it. */
+    const val NAME = "iOS 27 (OneiOS)"
+    const val SHORT_NAME = "iOS 27"
+    const val BLURB = "Apple's iOS 27 on this phone's own kernel, run by OneiOS's xnuhost. " +
+        "You build the image yourself from Apple's firmware; OneOS never downloads it."
+
+    /** Root's stage for it: separate from the Android guests' ([Images.STAGE_NAME]'s folder). */
+    const val STAGE = "/data/local/tmp/oneios"
+
+    /** The session contract between the session scripts and xnuhost (OneiOS's oneos/interface.md). */
+    const val SESSION_ABI = 1
+
+    /** The manifest `format` of both a runtime package and an image set this build reads. */
+    const val FORMAT = 1
+
+    /** The only phone it is offered on: the Galaxy S24 Ultra (SM-S928, e3q, SM8650). */
+    val PROFILE_IDS: Set<String> = setOf(Profiles.ID_S_ULTRA_8650)
+
+    const val R_NOT_THIS_PHONE = "oneios-not-this-phone"
+    const val R_EXPERIMENTAL = "oneios-experimental"
+    const val GATE_ID = "gate-oneios"
+
+    /** What the experimental tick says. */
+    const val ACK = "I understand that iOS 27 (OneiOS) is experimental, has never been tested on a phone like this one, " +
+        "and that One UI stops while it runs. Volume Up + Volume Down for 3 seconds brings One UI back."
+
+    fun offeredOn(profile: PhoneProfile?): Boolean = profile != null && profile.enabled && profile.id in PROFILE_IDS
+
+    /** The phone itself, by the three ids a profile matches on. */
+    fun offeredOn(model: String, device: String, soc: String, profiles: List<PhoneProfile> = Profiles.BUILT_IN): Boolean =
+        offeredOn(Profiles.resolve(model, device, soc, profiles).profile)
+
+    /**
+     * The system-kind gate: BLOCK on every phone but the Galaxy S24 Ultra; there a
+     * WARN the user has to tick ([ACK]) before every switch, as for an untested
+     * profile, and OK once [ticked].
+     */
+    fun gate(profile: PhoneProfile?, ticked: Boolean): Finding = when {
+        !offeredOn(profile) -> Finding(
+            GATE_ID, Level.BLOCK, "$NAME is not for this phone",
+            "$NAME runs on the Galaxy S24 Ultra (SM-S928) only" + (profile?.let { "; this is the ${it.label}" } ?: "") + ".",
+            R_NOT_THIS_PHONE,
+        )
+        !ticked -> Finding(GATE_ID, Level.WARN, "$NAME is experimental", ACK, R_EXPERIMENTAL)
+        else -> Finding(GATE_ID, Level.OK, "$NAME: experimental, acknowledged")
+    }
+}
+
+/** The two things OneOS stages for iOS; [word] is root's name for it, [manifestName] the file at its top. */
+enum class OneiosKind(val word: String, val manifestName: String, val label: String) {
+    RUNTIME("runtime", "runtime.json", "OneiOS runtime"),
+    IMAGE("image", "manifest.json", "iOS image set"),
+}
+
+/** One file a manifest lists. [mode] is `0644` or `0755`. */
+data class OneiosFile(val path: String, val size: Long, val sha256: String, val mode: String = "0644")
+
+/**
+ * A checked `runtime.json` or `manifest.json`. [files] never names the manifest
+ * itself. The runtime's own fields are null for an image set and the other way round.
+ */
+data class OneiosManifest(
+    val kind: OneiosKind,
+    val format: Int,
+    val version: String,
+    val files: List<OneiosFile>,
+    /** Runtime: the session contract it speaks, the path of xnuhost, the image formats it boots. */
+    val sessionAbi: Int? = null,
+    val xnuhost: String? = null,
+    val imageFormats: List<Int> = emptyList(),
+    /** Runtime: its xnuhost is OneiOS's stand-in that only says "not built yet" (`"placeholder": true`): it stages, and the switch refuses it. */
+    val placeholder: Boolean = false,
+    /** Runtime: the lowest version of this fork that can run it (`min_oneos_fork`); null = any. */
+    val minOneosFork: String? = null,
+    /** Image set: Apple's build ("24A..."), the device it is of ("iPhone18,2"), "iOS". */
+    val build: String? = null,
+    val device: String? = null,
+    val os: String? = null,
+) {
+    val bytes: Long get() = files.sumOf { it.size }
+    fun file(path: String): OneiosFile? = files.firstOrNull { it.path == path }
+}
+
+/** What was really there for one path: what the app read, or what root wrote. */
+data class OneiosSeen(val path: String, val size: Long, val sha256: String)
+
+object OneiosManifests {
+    /** A manifest is small: a list of files. */
+    const val MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+
+    /** One file of a package: root's `receive` takes at most this. */
+    const val MAX_FILE_BYTES = 16L * 1024 * 1024 * 1024
+    const val MAX_FILES = 4096
+
+    private val SEGMENT = Regex("^[A-Za-z0-9_][A-Za-z0-9._+-]*$")
+    private val HEX64 = Regex("^[0-9a-f]{64}$")
+    private val WORD = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+
+    /** A relative path of plain segments (what root's `receive` accepts). */
+    fun validPath(path: String): Boolean =
+        path.length in 1..200 && !path.contains("..") && path.split('/').all { SEGMENT.matches(it) }
+
+    /**
+     * The manifest [text] says, or why it is not one. Unknown keys are ignored
+     * (the image builder may add its own); everything this app acts on is checked.
+     */
+    fun parse(kind: OneiosKind, text: String): Result<OneiosManifest> = runCatching {
+        val name = kind.manifestName
+        if (text.length > MAX_MANIFEST_BYTES) error("$name is too long")
+        val root = JsonRead.parse(text) as? Map<*, *> ?: error("$name is not a JSON object")
+        fun int(key: String): Int? = when (val v = root[key]) {
+            null -> null
+            is Long -> if (v in 0..Int.MAX_VALUE.toLong()) v.toInt() else error("$name: $key is out of range")
+            else -> error("$name: $key is not a whole number")
+        }
+        fun word(key: String, required: Boolean): String? = when (val v = root[key]) {
+            null -> if (required) error("$name has no $key") else null
+            is String -> if (WORD.matches(v)) v else error("$name: $key '${v.take(40)}' is not a plain word")
+            else -> error("$name: $key is not a string")
+        }
+        val format = int("format") ?: error("$name has no format")
+        if (format != OneiosSystem.FORMAT) {
+            error("$name is format $format; this version of OneOS reads format ${OneiosSystem.FORMAT}" +
+                if (format > OneiosSystem.FORMAT) " (update OneOS)" else "")
+        }
+        val version = word("version", required = true)!!
+        val want = if (kind == OneiosKind.RUNTIME) "oneios-runtime" else "oneios-image"
+        root["name"]?.let { if (it != want) error("$name is a '${it.toString().take(40)}', not a $want") }
+        val list = root["files"] as? List<*> ?: error("$name has no files list")
+        if (list.isEmpty()) error("$name lists no files")
+        if (list.size > MAX_FILES) error("$name lists ${list.size} files (at most $MAX_FILES)")
+        val seen = HashSet<String>()
+        val files = list.mapIndexed { i, item ->
+            val o = item as? Map<*, *> ?: error("$name: files[$i] is not an object")
+            val path = o["path"] as? String ?: error("$name: files[$i] has no path")
+            if (!validPath(path)) error("$name: '${path.take(80)}' is not a plain relative path")
+            if (path == name) error("$name lists itself")
+            if (!seen.add(path)) error("$name lists $path twice")
+            // A file where another entry needs a folder ("a" and "a/b").
+            val size = o["size"] as? Long ?: error("$name: $path has no size")
+            if (size !in 0..MAX_FILE_BYTES) error("$name: $path has size $size")
+            val sha = (o["sha256"] as? String)?.lowercase(Locale.ROOT) ?: error("$name: $path has no sha256")
+            if (!HEX64.matches(sha)) error("$name: $path has a malformed sha256")
+            val mode = when (val m = o["mode"]) {
+                null -> "0644"
+                "0644", "0755" -> m as String
+                else -> error("$name: $path has mode '$m' (0644 or 0755)")
+            }
+            OneiosFile(path, size, sha, mode)
+        }
+        for (f in files) {
+            var dir = f.path.substringBeforeLast('/', "")
+            while (dir.isNotEmpty()) {
+                if (dir in seen) error("$name: $dir is both a file and a folder")
+                dir = dir.substringBeforeLast('/', "")
+            }
+        }
+        when (kind) {
+            OneiosKind.RUNTIME -> {
+                val abi = int("session_abi") ?: error("$name has no session_abi")
+                val x = root["xnuhost"] as? String ?: error("$name names no xnuhost: this runtime cannot start iOS yet")
+                val xf = files.firstOrNull { it.path == x } ?: error("$name: xnuhost '$x' is not one of its files")
+                if (xf.mode != "0755") error("$name: xnuhost $x is not mode 0755")
+                val arch = root["arch"]
+                if (arch != null && arch != "arm64") error("$name: arch '$arch' is not arm64")
+                val formats = (root["image_formats"] as? List<*> ?: error("$name has no image_formats")).map {
+                    (it as? Long)?.takeIf { v -> v in 0..9999 }?.toInt() ?: error("$name: image_formats holds '$it'")
+                }
+                if (formats.isEmpty()) error("$name: image_formats is empty")
+                val placeholder = when (val v = root["placeholder"]) {
+                    null -> false
+                    is Boolean -> v
+                    else -> error("$name: placeholder is not true or false")
+                }
+                OneiosManifest(
+                    kind, format, version, files, sessionAbi = abi, xnuhost = x, imageFormats = formats.distinct(),
+                    placeholder = placeholder, minOneosFork = word("min_oneos_fork", required = false),
+                )
+            }
+            OneiosKind.IMAGE -> OneiosManifest(
+                kind, format, version, files,
+                build = word("build", required = false),
+                device = (root["device"] as? String)?.take(40),
+                os = (root["os"] as? String)?.take(40),
+            )
+        }
+    }
+
+    /**
+     * Verifies what was found ([seen]) against [manifest]: every listed file
+     * present once with its size and SHA-256, and nothing else. Empty = verified.
+     */
+    fun verify(manifest: OneiosManifest, seen: List<OneiosSeen>): List<String> {
+        val problems = mutableListOf<String>()
+        val byPath = HashMap<String, OneiosSeen>()
+        for (s in seen) {
+            if (s.path == manifest.kind.manifestName) continue
+            if (byPath.put(s.path, s) != null) problems += "${s.path} is there twice"
+            val want = manifest.file(s.path)
+            when {
+                want == null -> problems += "${s.path} is not in ${manifest.kind.manifestName}"
+                want.size != s.size -> problems += "${s.path} is ${s.size} bytes, ${manifest.kind.manifestName} says ${want.size}"
+                want.sha256 != s.sha256.lowercase(Locale.ROOT) ->
+                    problems += "${s.path} does not match its SHA-256 (${s.sha256.take(12)}..., expected ${want.sha256.take(12)}...)"
+            }
+        }
+        for (f in manifest.files) if (f.path !in byPath) problems += "${f.path} is missing"
+        return problems
+    }
+
+    /**
+     * "0.4.74" against a runtime's `min_oneos_fork`: [have] is at least [need], number by number
+     * (a suffix such as "-s25" is not counted). A version that does not parse is not enough.
+     */
+    fun versionAtLeast(have: String, need: String): Boolean {
+        fun parts(v: String): List<Int>? = v.substringBefore('-').split('.').map { it.toIntOrNull() ?: return null }
+        val h = parts(have) ?: return false
+        val n = parts(need) ?: return false
+        for (i in 0 until maxOf(h.size, n.size)) {
+            val a = h.getOrElse(i) { 0 }
+            val b = n.getOrElse(i) { 0 }
+            if (a != b) return a > b
+        }
+        return true
+    }
+
+    /**
+     * Whether the staged pair can start a session, as `oneios_switch.sh` decides it
+     * again as root: the runtime speaks this build's session ABI and boots the
+     * image set's format. null = yes; else the one line why not.
+     */
+    fun pairProblem(runtime: OneiosManifest?, image: OneiosManifest?): String? = when {
+        runtime == null -> "No OneiOS runtime is staged: xnuhost, the program that runs iOS, comes with it."
+        runtime.sessionAbi != OneiosSystem.SESSION_ABI ->
+            "The runtime ${runtime.version} speaks session ABI ${runtime.sessionAbi}, this OneOS speaks ${OneiosSystem.SESSION_ABI}."
+        runtime.placeholder -> "The runtime ${runtime.version} carries a placeholder instead of xnuhost: OneiOS has not built xnuhost yet."
+        image == null -> "No iOS image set is staged: import the one you built with OneiOS's scripts."
+        image.format !in runtime.imageFormats ->
+            "The image set is format ${image.format}; the runtime ${runtime.version} boots format(s) ${runtime.imageFormats.joinToString(", ")}."
+        else -> null
+    }
+}
+
+/** The runtime package of one OneiOS release: the asset to download and the file holding its SHA-256. */
+data class OneiosRelease(
+    val tag: String,
+    val version: String,
+    val assetName: String,
+    val assetUrl: String,
+    val assetBytes: Long,
+    val sha256Url: String,
+)
+
+/**
+ * OneiOS's releases (github.com/akshaynexus/OneiOS): they carry only OneiOS's
+ * own code. The runtime is the asset `oneios-runtime-<version>-arm64.tar.zst`
+ * with `<that name>.sha256` beside it. The latest release, or a pinned tag.
+ */
+object OneiosReleases {
+    const val REPO = "akshaynexus/OneiOS"
+    const val PAGE_URL = "https://github.com/$REPO/releases"
+    const val LATEST_API = "https://api.github.com/repos/$REPO/releases/latest"
+    private const val DOWNLOAD_PREFIX = "https://github.com/$REPO/releases/download/"
+
+    /** Larger than any runtime package (xnuhost, the stub, the host drivers' user side). */
+    const val MAX_ASSET_BYTES = 512L * 1024 * 1024
+
+    val ASSET = Regex("^oneios-runtime-([0-9A-Za-z][0-9A-Za-z._-]{0,39})-arm64\\.tar\\.zst$")
+    private val TAG = Regex("^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
+    private val HEX64 = Regex("^[0-9a-f]{64}$")
+
+    fun validTag(tag: String): Boolean = TAG.matches(tag) && !tag.contains("..")
+
+    /** The API address of the release to read: [tag]'s, or the latest when null or blank. */
+    fun apiUrl(tag: String?): String {
+        val t = tag?.trim().orEmpty()
+        if (t.isEmpty()) return LATEST_API
+        require(validTag(t)) { "'$t' is not a release tag" }
+        return "https://api.github.com/repos/$REPO/releases/tags/$t"
+    }
+
+    /** What to say when GitHub answers 404 for [tag] (null: the latest). */
+    fun noRelease(tag: String?): String =
+        if (tag.isNullOrBlank()) "OneiOS has not published a release yet, so there is no runtime to download. " +
+            "If you built one yourself, use \"I have the file\"."
+        else "OneiOS has no release named $tag."
+
+    /**
+     * The runtime package in GitHub's release JSON [text], or why there is none.
+     * Only assets of this repository's own releases are taken.
+     */
+    fun parse(text: String): Result<OneiosRelease> = runCatching {
+        val root = JsonRead.parse(text) as? Map<*, *> ?: error("the release answer is not a JSON object")
+        val tag = root["tag_name"] as? String ?: error("the release answer names no tag")
+        if (!validTag(tag)) error("release tag '${tag.take(40)}'")
+        val assets = (root["assets"] as? List<*>).orEmpty().mapNotNull { it as? Map<*, *> }
+        fun url(a: Map<*, *>): String? = (a["browser_download_url"] as? String)?.takeIf { it.startsWith(DOWNLOAD_PREFIX) }
+        val candidates = assets.filter { a -> (a["name"] as? String)?.let(ASSET::matches) == true }
+        if (candidates.isEmpty()) error("release $tag has no runtime package (oneios-runtime-<version>-arm64.tar.zst)")
+        if (candidates.size > 1) error("release $tag has ${candidates.size} runtime packages")
+        val a = candidates.single()
+        val name = a["name"] as String
+        val bytes = a["size"] as? Long ?: error("$name has no size")
+        if (bytes !in 1..MAX_ASSET_BYTES) error("$name is $bytes bytes")
+        val assetUrl = url(a) ?: error("$name is not a file of $REPO's releases")
+        val sha = assets.firstOrNull { it["name"] == "$name.sha256" } ?: error("release $tag has no $name.sha256")
+        val shaUrl = url(sha) ?: error("$name.sha256 is not a file of $REPO's releases")
+        OneiosRelease(tag, ASSET.matchEntire(name)!!.groupValues[1], name, assetUrl, bytes, shaUrl)
+    }
+
+    /**
+     * The SHA-256 in a `.sha256` file: one `sha256sum` line (`<hex>  <name>`), or
+     * the bare hash. A line naming another file than [assetName] is not it.
+     */
+    fun parseSha256(text: String, assetName: String): String? {
+        val lines = text.lineSequence().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }.toList()
+        if (lines.size != 1) return null
+        val parts = lines[0].split(Regex("\\s+"))
+        val hex = parts[0].lowercase(Locale.ROOT)
+        if (!HEX64.matches(hex)) return null
+        return when (parts.size) {
+            1 -> hex
+            2 -> hex.takeIf { parts[1].removePrefix("*").substringAfterLast('/') == assetName }
+            else -> null
+        }
+    }
+}
+
+/**
+ * A strict reader for the small JSON files this app is handed (a manifest,
+ * GitHub's release answer): objects as `Map<String, Any?>` (a key twice is an
+ * error), arrays as `List<Any?>`, strings, whole numbers as `Long`, others as
+ * `Double`, `true`/`false`/`null`. No serialization library in :core:model.
+ */
+object JsonRead {
+    private const val MAX_DEPTH = 32
+
+    fun parse(text: String): Any? {
+        val p = Parser(text)
+        p.ws()
+        val v = p.value(0)
+        p.ws()
+        if (p.i != text.length) p.fail("text after the value")
+        return v
+    }
+
+    private class Parser(val s: String) {
+        var i = 0
+
+        fun fail(what: String): Nothing = throw IllegalArgumentException("JSON: $what at ${i.coerceAtMost(s.length)}")
+
+        fun ws() {
+            while (i < s.length && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) i++
+        }
+
+        fun value(depth: Int): Any? {
+            if (depth > MAX_DEPTH) fail("nested too deep")
+            if (i >= s.length) fail("unexpected end")
+            return when (val c = s[i]) {
+                '{' -> obj(depth)
+                '[' -> arr(depth)
+                '"' -> str()
+                't' -> lit("true", true)
+                'f' -> lit("false", false)
+                'n' -> lit("null", null)
+                else -> if (c == '-' || c in '0'..'9') num() else fail("unexpected '$c'")
+            }
+        }
+
+        private fun lit(word: String, v: Any?): Any? {
+            if (!s.startsWith(word, i)) fail("unexpected text")
+            i += word.length
+            return v
+        }
+
+        private fun obj(depth: Int): Map<String, Any?> {
+            val out = LinkedHashMap<String, Any?>()
+            i++
+            ws()
+            if (i < s.length && s[i] == '}') { i++; return out }
+            while (true) {
+                ws()
+                if (i >= s.length || s[i] != '"') fail("expected a key")
+                val k = str()
+                ws()
+                if (i >= s.length || s[i] != ':') fail("expected ':'")
+                i++
+                ws()
+                if (out.containsKey(k)) fail("key '$k' twice")
+                out[k] = value(depth + 1)
+                ws()
+                if (i >= s.length) fail("unexpected end")
+                when (s[i++]) {
+                    ',' -> continue
+                    '}' -> return out
+                    else -> { i--; fail("expected ',' or '}'") }
+                }
+            }
+        }
+
+        private fun arr(depth: Int): List<Any?> {
+            val out = ArrayList<Any?>()
+            i++
+            ws()
+            if (i < s.length && s[i] == ']') { i++; return out }
+            while (true) {
+                ws()
+                out += value(depth + 1)
+                ws()
+                if (i >= s.length) fail("unexpected end")
+                when (s[i++]) {
+                    ',' -> continue
+                    ']' -> return out
+                    else -> { i--; fail("expected ',' or ']'") }
+                }
+            }
+        }
+
+        private fun str(): String {
+            val out = StringBuilder()
+            i++
+            while (true) {
+                if (i >= s.length) fail("unterminated string")
+                val c = s[i++]
+                when {
+                    c == '"' -> return out.toString()
+                    c == '\\' -> {
+                        if (i >= s.length) fail("unterminated escape")
+                        when (val e = s[i++]) {
+                            '"', '\\', '/' -> out.append(e)
+                            'n' -> out.append('\n')
+                            'r' -> out.append('\r')
+                            't' -> out.append('\t')
+                            'b' -> out.append('\b')
+                            'f' -> out.append('\u000c')
+                            'u' -> {
+                                if (i + 4 > s.length) fail("short \\u escape")
+                                val code = s.substring(i, i + 4).toIntOrNull(16) ?: fail("bad \\u escape")
+                                out.append(code.toChar())
+                                i += 4
+                            }
+                            else -> { i--; fail("bad escape") }
+                        }
+                    }
+                    c < ' ' -> { i--; fail("control character in a string") }
+                    else -> out.append(c)
+                }
+            }
+        }
+
+        private fun num(): Any {
+            val start = i
+            if (s[i] == '-') i++
+            while (i < s.length && s[i] in '0'..'9') i++
+            var whole = true
+            if (i < s.length && s[i] == '.') {
+                whole = false
+                i++
+                while (i < s.length && s[i] in '0'..'9') i++
+            }
+            if (i < s.length && (s[i] == 'e' || s[i] == 'E')) {
+                whole = false
+                i++
+                if (i < s.length && (s[i] == '+' || s[i] == '-')) i++
+                while (i < s.length && s[i] in '0'..'9') i++
+            }
+            val t = s.substring(start, i)
+            return if (whole) t.toLongOrNull() ?: run { i = start; fail("number out of range") }
+            else t.toDoubleOrNull() ?: run { i = start; fail("bad number") }
+        }
+    }
+}
+
+/**
+ * A streaming tar reader for the two packages (ustar, with pax `x`/`g` headers
+ * and GNU long names): regular files and folders only. A link, a device or any
+ * other member is an error, never skipped.
+ */
+class TarReader(private val input: InputStream) {
+    class Entry(val name: String, val size: Long, val directory: Boolean)
+
+    private var remaining = 0L
+    private var padding = 0L
+
+    /** The next member, or null at the end of the archive. Skips what is left of the one before. */
+    fun next(): Entry? {
+        skipFully(remaining + padding)
+        remaining = 0
+        padding = 0
+        var longName: String? = null
+        var paxPath: String? = null
+        var paxSize: Long? = null
+        while (true) {
+            val h = ByteArray(512)
+            if (!readBlock(h)) return null
+            if (h.all { it.toInt() == 0 }) return null
+            checksum(h)
+            val size = number(h, 124, 12)
+            val type = h[156].toInt().toChar()
+            val pad = (512 - size % 512) % 512
+            when (type) {
+                'x', 'g', 'L' -> {
+                    if (size > 1024 * 1024) throw IOException("tar: an extended header of $size bytes")
+                    val body = ByteArray(size.toInt())
+                    readFully(body)
+                    skipFully(pad)
+                    when (type) {
+                        'L' -> longName = body.toString(Charsets.UTF_8).trimEnd('\u0000')
+                        'x' -> for ((k, v) in pax(body)) {
+                            if (k == "path") paxPath = v
+                            if (k == "size") paxSize = v.toLongOrNull() ?: throw IOException("tar: pax size '$v'")
+                        }
+                    }
+                }
+                '0', '\u0000', '5' -> {
+                    val prefix = text(h, 345, 155)
+                    val base = text(h, 0, 100)
+                    val name = paxPath ?: longName ?: if (prefix.isEmpty()) base else "$prefix/$base"
+                    val dir = type == '5' || name.endsWith("/")
+                    val real = if (dir) 0L else paxSize ?: size
+                    remaining = real
+                    padding = (512 - real % 512) % 512
+                    return Entry(name.removePrefix("./").trimEnd('/'), real, dir)
+                }
+                else -> throw IOException("tar: '${text(h, 0, 100).take(80)}' is a link or a special file (type '$type'); only files and folders are allowed")
+            }
+        }
+    }
+
+    /** The current member's bytes: ends after its size. Read it before [next], or it is skipped. */
+    fun data(): InputStream = object : InputStream() {
+        override fun read(): Int {
+            val b = ByteArray(1)
+            return if (read(b, 0, 1) < 0) -1 else b[0].toInt() and 0xff
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (remaining <= 0) return -1
+            val n = input.read(b, off, minOf(len.toLong(), remaining).toInt())
+            if (n < 0) throw EOFException("tar: the archive ends inside a file")
+            remaining -= n
+            return n
+        }
+    }
+
+    private fun pax(body: ByteArray): List<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>()
+        var i = 0
+        while (i < body.size) {
+            var j = i
+            while (j < body.size && body[j] != ' '.code.toByte()) j++
+            val len = String(body, i, j - i, Charsets.US_ASCII).toIntOrNull() ?: throw IOException("tar: malformed pax header")
+            if (len <= j - i + 1 || i + len > body.size) throw IOException("tar: malformed pax header")
+            val rec = String(body, j + 1, len - (j - i) - 2, Charsets.UTF_8)
+            val eq = rec.indexOf('=')
+            if (eq > 0) out += rec.substring(0, eq) to rec.substring(eq + 1)
+            i += len
+        }
+        return out
+    }
+
+    private fun checksum(h: ByteArray) {
+        val want = number(h, 148, 8)
+        var sum = 0L
+        for (i in 0 until 512) sum += if (i in 148..155) 32 else (h[i].toInt() and 0xff)
+        if (sum != want) throw IOException("tar: bad header checksum (not a tar archive, or damaged)")
+    }
+
+    private fun text(h: ByteArray, off: Int, len: Int): String {
+        var end = off
+        while (end < off + len && h[end].toInt() != 0) end++
+        return String(h, off, end - off, Charsets.UTF_8)
+    }
+
+    /** Octal, or GNU's base-256 for sizes over 8 GiB. */
+    private fun number(h: ByteArray, off: Int, len: Int): Long {
+        if (h[off].toInt() and 0x80 != 0) {
+            var v = 0L
+            for (i in off + 1 until off + len) {
+                if (v > (Long.MAX_VALUE shr 8)) throw IOException("tar: number too large")
+                v = (v shl 8) or (h[i].toLong() and 0xff)
+            }
+            return v
+        }
+        val t = text(h, off, len).trim()
+        if (t.isEmpty()) return 0
+        return t.toLongOrNull(8) ?: throw IOException("tar: malformed number '$t'")
+    }
+
+    private fun readBlock(b: ByteArray): Boolean {
+        var n = 0
+        while (n < b.size) {
+            val k = input.read(b, n, b.size - n)
+            if (k < 0) {
+                if (n == 0) return false
+                throw EOFException("tar: the archive ends inside a header")
+            }
+            n += k
+        }
+        return true
+    }
+
+    private fun readFully(b: ByteArray) {
+        var n = 0
+        while (n < b.size) {
+            val k = input.read(b, n, b.size - n)
+            if (k < 0) throw EOFException("tar: the archive ends inside a header")
+            n += k
+        }
+    }
+
+    private fun skipFully(count: Long) {
+        var left = count
+        val buf = ByteArray(1 shl 16)
+        while (left > 0) {
+            val k = input.read(buf, 0, minOf(left, buf.size.toLong()).toInt())
+            if (k < 0) throw EOFException("tar: the archive ends inside a file")
+            left -= k
+        }
+    }
+}
+
+/**
+ * Reads a runtime package or an image set (the tar inside the `.tar.zst`; the
+ * caller decompresses) in two passes over the same file:
+ *  1. [readManifest]: finds the manifest, at the top or under one top folder,
+ *     and stops there (at once when it is the first member);
+ *  2. [unpack]: hands every listed file to the sink while hashing it, and
+ *     refuses anything the manifest does not list, a wrong size, a wrong
+ *     SHA-256 and a missing file.
+ * Root checks each file's size and SHA-256 again as it writes it.
+ */
+object OneiosPackage {
+    class Problem(message: String) : IOException(message)
+
+    /** Where the manifest was found: [prefix] is "" or "<top folder>/". */
+    data class Found(val prefix: String, val text: String)
+
+    fun interface Sink {
+        /** Must read [data] to its end; [file] is the manifest's entry for it. */
+        fun file(file: OneiosFile, data: InputStream)
+    }
+
+    fun readManifest(tar: InputStream, kind: OneiosKind): Found {
+        val reader = TarReader(tar)
+        while (true) {
+            val e = reader.next() ?: throw Problem("no ${kind.manifestName} in this file: it is not a ${kind.label}")
+            if (e.directory) continue
+            val parts = e.name.split('/')
+            if (parts.last() != kind.manifestName || parts.size > 2) continue
+            if (e.size > OneiosManifests.MAX_MANIFEST_BYTES) throw Problem("${kind.manifestName} is too long")
+            val text = reader.data().readBytes().toString(Charsets.UTF_8)
+            return Found(if (parts.size == 2) parts[0] + "/" else "", text)
+        }
+    }
+
+    /** Returns what was unpacked (every listed file, verified). [progress] gets the bytes of files done so far. */
+    fun unpack(
+        tar: InputStream,
+        manifest: OneiosManifest,
+        prefix: String,
+        sink: Sink,
+        progress: (Long) -> Unit = {},
+    ): List<OneiosSeen> {
+        val name = manifest.kind.manifestName
+        val reader = TarReader(tar)
+        val seen = ArrayList<OneiosSeen>()
+        val done = HashSet<String>()
+        var bytes = 0L
+        while (true) {
+            val e = reader.next() ?: break
+            if (!e.name.startsWith(prefix) && e.name + "/" != prefix) {
+                throw Problem("${e.name.take(80)} is outside ${prefix.trimEnd('/')}")
+            }
+            if (e.directory) continue
+            val path = e.name.removePrefix(prefix)
+            if (path == name) continue
+            val want = manifest.file(path) ?: throw Problem("$path is not in $name")
+            if (!done.add(path)) throw Problem("$path is in the file twice")
+            if (e.size != want.size) throw Problem("$path is ${e.size} bytes, $name says ${want.size}")
+            val md = MessageDigest.getInstance("SHA-256")
+            val raw = reader.data()
+            val base = bytes
+            var read = 0L
+            val hashing = object : InputStream() {
+                override fun read(): Int {
+                    val b = ByteArray(1)
+                    return if (read(b, 0, 1) < 0) -1 else b[0].toInt() and 0xff
+                }
+
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val n = raw.read(b, off, len)
+                    if (n > 0) {
+                        md.update(b, off, n)
+                        read += n
+                        progress(base + read)
+                    }
+                    return n
+                }
+            }
+            sink.file(want, hashing)
+            if (read != want.size) throw Problem("$path was not read to its end")
+            val sha = Hashes.hex(md.digest())
+            if (sha != want.sha256) throw Problem("$path does not match its SHA-256 (${sha.take(12)}..., expected ${want.sha256.take(12)}...)")
+            seen += OneiosSeen(path, read, sha)
+            bytes += read
+        }
+        val problems = OneiosManifests.verify(manifest, seen)
+        if (problems.isNotEmpty()) throw Problem(problems.first() + if (problems.size > 1) " (and ${problems.size - 1} more)" else "")
+        return seen
+    }
+}

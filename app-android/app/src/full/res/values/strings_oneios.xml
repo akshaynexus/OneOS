@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The iOS 27 (OneiOS) system (docs/oneios.md): its card on Choose a system and its own screen. -->
+    <string name="oneios_title">iOS 27 (OneiOS)</string>
+    <string name="oneios_open">Open</string>
+    <string name="oneios_switch">Switch to iOS 27</string>
+    <string name="oneios_about">Apple\'s iOS 27 on this phone\'s own kernel, run by OneiOS\'s xnuhost. Experimental, for the Galaxy S24 Ultra only. One UI stops while it runs; Volume Up + Volume Down for 3 seconds brings it back.</string>
+    <string name="oneios_ack">I understand that iOS 27 (OneiOS) is experimental, has never been tested on a phone like this one, and that One UI stops while it runs. Volume Up + Volume Down for 3 seconds brings One UI back.</string>
+    <string name="oneios_runtime">OneiOS runtime</string>
+    <string name="oneios_runtime_none">Not on this phone yet. It holds xnuhost, the program that runs iOS, and comes from OneiOS\'s releases.</string>
+    <string name="oneios_runtime_staged">Version %1$s, xnuhost at %2$s</string>
+    <string name="oneios_runtime_placeholder">Version %1$s, with a placeholder at %2$s: OneiOS has not built xnuhost yet</string>
+    <string name="oneios_runtime_download">Download from OneiOS\'s releases</string>
+    <string name="oneios_runtime_download_line">The latest release, or a tag you name. Only OneiOS\'s own code.</string>
+    <string name="oneios_have_file">I have the file</string>
+    <string name="oneios_runtime_file_line">A oneios-runtime-…-arm64.tar.zst you built or downloaded</string>
+    <string name="oneios_image">iOS image set</string>
+    <string name="oneios_image_none">Not on this phone yet. You build it from Apple\'s firmware with OneiOS\'s scripts; OneOS never downloads it.</string>
+    <string name="oneios_image_staged">iOS %1$s (%2$s), format %3$s, %4$s</string>
+    <string name="oneios_image_file_line">The .tar.zst image set you built. It is checked against its manifest.json.</string>
+    <string name="oneios_image_how">How to build the image set</string>
+    <string name="oneios_image_how_line">OneiOS on GitHub</string>
+    <string name="oneios_session">Session</string>
+    <string name="oneios_ready">Ready to switch</string>
+    <string name="oneios_not_ready">Cannot switch yet</string>
+    <string name="oneios_checking">Checking…</string>
+    <string name="oneios_last_return_inplace">The last session returned to One UI without a restart.</string>
+    <string name="oneios_last_return_failsafe">The last session returned to One UI by restarting the phone: %1$s</string>
+    <string name="oneios_last_return_reboot">The last session returned to One UI by a restart.</string>
+    <string name="oneios_remove">Remove the iOS files</string>
+    <string name="oneios_remove_line">The runtime, the image set and iOS\'s own data on this phone</string>
+    <string name="oneios_remove_confirm">Remove the OneiOS runtime, the iOS image set and everything iOS stored? The files you imported them from stay where they are.</string>
+    <string name="oneios_tag_title">Which release?</string>
+    <string name="oneios_tag_hint">Release tag (empty: the latest)</string>
+    <string name="oneios_stop">Stop</string>
+    <string name="oneios_not_this_phone">iOS 27 (OneiOS) is for the Galaxy S24 Ultra (SM-S928) only.</string>
+    <string name="oneios_switch_confirm">One UI stops and iOS 27 starts. Hold Volume Up + Volume Down for 3 seconds to come back; if the screen stays black for long, One UI returns by itself, by a restart at worst.</string>
+</resources>

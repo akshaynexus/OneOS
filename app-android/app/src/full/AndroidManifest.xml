@@ -26,6 +26,12 @@
             android:name=".session.AppUpdater$ResultReceiver"
             android:exported="false" />
         <activity android:name=".ui.GuestRuntimeActivity" android:exported="false" />
+        <!-- The iOS 27 (OneiOS) system's screen (docs/oneios.md): runtime, image set, switch. -->
+        <activity
+            android:name=".ui.OneiosActivity"
+            android:exported="false"
+            android:label="@string/oneios_title"
+            android:parentActivityName=".ui.SystemsActivity" />
         <activity android:name=".ui.EnvironmentActivity" android:exported="false" />
         <activity android:name=".ui.BootProgressActivity" android:exported="false" />
         <activity android:name=".ui.DebugSettingsActivity" android:exported="false" />
