@@ -9,12 +9,19 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.Paths
+import java.util.concurrent.TimeUnit
 
 /**
  * The OneiOS root script, its launcher and the session script's stage checks,
  * run under the machine's shells against a fake root folder
  * (`ONEIOS_TEST_ROOT`): nothing is started there, and the scripts refuse the
  * test root as uid 0.
+ *
+ * The way back to One UI (the key readers, the watcher, `oneios_return.sh`)
+ * runs there against a fake phone ([Fake.phone]): stand-ins for Android's
+ * tools (`src/test/resources/oneios/phone-tools.sh`), processes as folders,
+ * and a clock that runs faster. No real process is signalled or stopped.
  */
 class OneiosScriptTest {
     private val rootScript = File(Shipped.fullAssets, OneiosRoot.ASSET)
@@ -26,10 +33,29 @@ class OneiosScriptTest {
         (listOf("/bin/sh") + TestShell.available().filterNot { it.appletsFirst }.map { it.path }).filter { File(it).canExecute() }.distinct()
 
     private val roots = mutableListOf<File>()
+    private val started = mutableListOf<Process>()
 
     @After
     fun cleanUp() {
+        // Whatever a fake getevent or a hanging stand-in still waits for ends, then every script a test left running.
+        roots.forEach { r -> runCatching { File(r, "events/stop").createNewFile(); File(r, "behave/unhang").createNewFile() } }
+        started.forEach { p ->
+            // Process.descendants() by name: the tests compile against Android's java.lang.Process, which has none.
+            runCatching {
+                val handle = Class.forName("java.lang.ProcessHandle").getMethod("destroyForcibly")
+                (Process::class.java.getMethod("descendants").invoke(p) as java.util.stream.Stream<*>).forEach { handle.invoke(it) }
+            }
+            p.destroyForcibly()
+        }
         roots.forEach { it.deleteRecursively() }
+    }
+
+    private fun await(what: String, ms: Long = 30_000, cond: () -> Boolean) {
+        val end = System.currentTimeMillis() + ms
+        while (!cond()) {
+            assertTrue("timed out waiting for: $what", System.currentTimeMillis() < end)
+            Thread.sleep(20)
+        }
     }
 
     private inner class Fake(val sh: String) {
@@ -100,7 +126,189 @@ class OneiosScriptTest {
             assertOk(receive("image", "overlay/kernel.kc", "kc".toByteArray()))
             return verb(OneiosRoot.Verb.FINISH, listOf("image", "3", format.toString(), "27.0.1", "24A446"))
         }
+
+        // --- A fake phone in an iOS session, for the way back ---------------------------
+
+        /** What xnuhost and the switch share (ready, return.request, the log). */
+        val session = File(stage, "session")
+
+        /** The way back's own folder: the state, the baseline, the pids, the keys. */
+        val control = File(stage, "control")
+        val busybox = File(root, "data/adb/ksu/bin/busybox")
+
+        fun file(path: String) = File(root, path)
+        fun lines(path: String): List<String> = file(path).takeIf { it.isFile }?.readLines().orEmpty()
+
+        /** What was asked of init, in order ("ctl.restart netd", "sys.powerctl reboot,..."). */
+        val setprops: List<String> get() = lines("log/setprop")
+        val kills: List<String> get() = lines("log/kill")
+        val returnLog: String get() = File(stage, "return.log").takeIf { it.isFile }?.readText().orEmpty()
+        val state: String get() = File(control, "state").takeIf { it.isFile }?.readText()?.trim().orEmpty()
+        val outcome: String get() = File(stage, "return.outcome").takeIf { it.isFile }?.readText()?.trim().orEmpty()
+        val rebooted: String? get() = setprops.firstOrNull { it.startsWith("sys.powerctl ") }?.substringAfter(' ')
+
+        fun behave(flag: String) = file("behave/$flag").createNewFile()
+
+        /** A process as a folder in the fake /proc: its mount namespace, name and command line. */
+        fun proc(pid: Int, name: String, ns: String = INIT_NS, cmdline: String = name): File {
+            val d = file("proc/$pid").apply { File(this, "ns").mkdirs() }
+            Files.deleteIfExists(File(d, "ns/mnt").toPath())
+            Files.createSymbolicLink(File(d, "ns/mnt").toPath(), Paths.get(ns))
+            File(d, "comm").writeText("$name\n")
+            File(d, "cmdline").writeText(cmdline.replace(' ', '\u0000') + "\u0000")
+            return d
+        }
+
+        private fun daemon(name: String, pid: Int, service: String? = null, initName: String = name) {
+            proc(pid, name)
+            file("pids/$name").writeText("$pid\n")
+            file("props").appendText("init.svc.$initName=running\n")
+            service?.let { file("services/${it.replace('/', '_')}").createNewFile() }
+        }
+
+        /**
+         * Makes this root a phone in an iOS session as `oneios_switch.sh` leaves it: One UI's daemons running and its
+         * framework stopped, xnuhost (pid [XNUHOST]) in its own mount namespace and cgroup, the baseline of the switch.
+         * [scale]: how much faster the scripts' clock runs (their `sleep`).
+         */
+        fun phone(scale: Int = 100, stopped: Boolean = true, state: String = "running") {
+            assertOk(verb(OneiosRoot.Verb.BEGIN, listOf("image")))
+            scripts()
+            val sleep = listOf("/usr/bin/sleep", "/bin/sleep").first { File(it).canExecute() }
+            val tools = OneiosScriptTest::class.java.getResourceAsStream("/oneios/phone-tools.sh")!!.readBytes().toString(Charsets.UTF_8).replace("@SLEEP@", sleep)
+            val names = listOf("getprop", "setprop", "pidof", "service", "getenforce", "am", "vdc", "sync", "renice", "lshal", "sleep", "now", "kill", "getevent")
+            for (f in names.map { file("bin/$it") } + listOf(busybox, File(busybox.parentFile, "resetprop"))) {
+                f.parentFile.mkdirs()
+                f.writeText(tools)
+                assertTrue(f.setExecutable(true))
+            }
+            for (d in listOf("log", "pids", "services", "behave", "events", "keystate", "sys/power", "sys/fs/cgroup/oneios_session", "vendor/etc/vintf")) file(d).mkdirs()
+            file("sys/fs/cgroup/oneios_session/cgroup.kill").writeText("")
+            file("sleep_scale").writeText("$scale\n")
+            file("nextpid").writeText("9000\n")
+            file("selinux").writeText("Enforcing\n")
+            file("vendor/etc/vintf/manifest.xml").writeText("<hal><name>android.hardware.graphics.composer3</name></hal>\n")
+            file("props").writeText("ro.product.model=SM-S928B\npersist.sys.timezone=Asia/Kolkata\ninit.svc.zygote=stopped\ninit.svc.zygote_secondary=stopped\n")
+            // One UI, without its framework.
+            proc(1, "init")
+            daemon("vold", 300, "vold")
+            daemon("keystore2", 301)
+            daemon("servicemanager", 302)
+            daemon("hwservicemanager", 303)
+            daemon("logd", 304)
+            daemon("lmkd", 305)
+            daemon("installd", 306, "installd")
+            daemon("surfaceflinger", 310, "SurfaceFlinger")
+            daemon("composer", 311, "android.hardware.graphics.composer3.IComposer/default", initName = COMPOSER)
+            file("props").appendText("init.svc_debug_pid.$COMPOSER=311\n")
+            daemon("audioserver", 312, "media.audio_policy")
+            file("services/media.audio_flinger").createNewFile()
+            daemon("netd", 313)
+            daemon("cameraserver", 314)
+            // The session.
+            for (d in listOf("base", "keys")) File(control, d).mkdirs()
+            File(session, "tmp").mkdirs()
+            File(control, "boot").writeText("boot-1\n")
+            File(control, "state").writeText("$state\n")
+            File(session, "xnuhost.log").writeText("guest: launchd\n")
+            if (state == "running") {
+                File(control, "xnuhost.pid").writeText("$XNUHOST\n")
+                File(control, "mntns").writeText("$GUEST_NS\n")
+                guest(XNUHOST, "xnuhost")
+            }
+            if (stopped) File(control, "stopped").writeText("1\n")
+            val base = File(control, "base")
+            File(base, "boot_id").writeText("boot-1\n")
+            File(base, "selinux").writeText("Enforcing\n")
+            File(base, "props").writeText(
+                (lines("props") + listOf("init.svc.zygote=running", "init.svc.zygote_secondary=running"))
+                    .associate { it.substringBefore('=') to it.substringAfter('=') }.entries.joinToString("") { "[${it.key}]: [${it.value}]\n" },
+            )
+            File(base, "pids").writeText("vold 300\nkeystore2 301\nsurfaceflinger 310\nservicemanager 302\n")
+            File(base, "mounts").writeText("/\n")
+        }
+
+        /** A process of the session: in xnuhost's mount namespace and cgroup. */
+        fun guest(pid: Int, name: String, ns: String = GUEST_NS, cgroup: Boolean = true): File {
+            val d = proc(pid, name, ns)
+            File(d, "mountinfo").writeText("1 0 8:1 / / rw - ext4 /dev/root rw\n40 1 254:50 /local/tmp/oneios /data rw - f2fs /dev/block/dm-50 rw\n")
+            if (cgroup) file("sys/fs/cgroup/oneios_session/cgroup.procs").appendText("$pid\n")
+            return d
+        }
+
+        private fun builder(script: String, args: List<String>, env: Map<String, String>): ProcessBuilder {
+            val pb = ProcessBuilder(listOf(sh, File(stage, script).path) + args).redirectErrorStream(true)
+            pb.environment()["ONEIOS_TEST_ROOT"] = root.path
+            pb.environment()["ONEIOS_TEST_SH"] = sh
+            pb.environment()["BB"] = busybox.path
+            pb.environment().putAll(env)
+            return pb
+        }
+
+        /** Runs a staged session script to its end. */
+        fun run(script: String, vararg args: String, env: Map<String, String> = emptyMap()): Ran {
+            val p = builder(script, args.toList(), env).start().also { started += it }
+            p.outputStream.close()
+            val text = p.inputStream.readBytes().toString(Charsets.UTF_8)
+            assertTrue("$script ${args.toList()} did not end:\n$text", p.waitFor(120, TimeUnit.SECONDS))
+            return Ran(p.exitValue(), text)
+        }
+
+        /** Starts a staged session script (a watcher, a key reader) and leaves it running; its output goes to [log]. */
+        fun start(script: String, vararg args: String, env: Map<String, String> = emptyMap(), log: String = "log/${args.first().trimStart('-')}"): Process {
+            val pb = builder(script, args.toList(), env).redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(file(log)))
+            return pb.start().also { started += it }
+        }
+
+        fun returns(who: String = "manual", env: Map<String, String> = emptyMap()) = run("oneios_return.sh", who, env = env)
+
+        /** One UI came back in place: its display, its services and its framework, in that order, and no reboot. */
+        fun assertInPlace(why: String = "") {
+            val log = setprops
+            val text = "$why\n${log.joinToString("\n")}\n$returnLog"
+            assertEquals(text, "returned", state)
+            assertTrue(text, outcome.startsWith("inplace "))
+            assertEquals(text, null, rebooted)
+            val order = listOf(
+                "ctl.restart $COMPOSER", "service.bootanim.exit 0", "ctl.start bootanim", "ctl.stop audioserver", "ctl.start audioserver",
+                "ctl.restart cameraserver", "ctl.restart wificond", "ctl.restart netd",
+            )
+            val at = order.map { log.indexOf(it) }
+            assertTrue("$at $text", at.all { it >= 0 } && at == at.sorted())
+            // A surfaceflinger and a composer that are not the session's old ones, and One UI's framework.
+            assertFalse(text, lines("pids/surfaceflinger") == listOf("310"))
+            assertFalse(text, lines("pids/composer") == listOf("311"))
+            assertTrue(text, file("pids/system_server").isFile && file("services/SurfaceFlinger").isFile)
+            assertTrue(text, returnLog.contains("One UI restored in place (Enforcing)."))
+            // Nothing of the session: no process, no guard mark, no lock, both wakelocks released.
+            assertFalse(text, file("proc/$XNUHOST").exists())
+            assertFalse(text, File(control, "return.guard").exists() || File(control, "returning.lock").exists())
+            assertEquals(text, "oneios_return", lines("sys/power/wake_unlock").lastOrNull())
+        }
+
+        /** A process of the session ends by itself. */
+        fun ends(pid: Int) {
+            file("proc/$pid").deleteRecursively()
+            val cg = file("sys/fs/cgroup/oneios_session/cgroup.procs")
+            cg.writeText(cg.readLines().filterNot { it == "$pid" }.joinToString("") { "$it\n" })
+        }
+
+        /** The return gave up on in place: the reboot was asked, and (unless it failed after that) One UI's framework was never started. */
+        fun assertFailsafe(part: String, frameworkStarted: Boolean = false) {
+            val text = "${setprops.joinToString("\n")}\n$returnLog"
+            assertEquals(text, frameworkStarted, setprops.any { it == "ctl.restart netd" || it == "ctl.start zygote" })
+            assertEquals(text, "reboot,oneios-inplace-failsafe", rebooted)
+            assertTrue("'$outcome' lacks '$part'", outcome.startsWith("failsafe ") && outcome.contains(part))
+            assertTrue(text, returnLog.contains("FAILSAFE: ") && returnLog.contains(part))
+            assertEquals(text, "returning", state)
+            // The last resorts after init's reboot: the kernel's, then sysrq.
+            assertTrue(text, lines("log/busybox").contains("reboot -f"))
+            assertEquals(text, listOf("b"), lines("proc/sysrq-trigger"))
+        }
     }
+
+    private class Ran(val exit: Int, val text: String)
 
     private fun assertOk(o: Fake.Out) = assertTrue(o.text, o.exit == 0 && o.reply.ok != null)
 
@@ -178,14 +386,14 @@ class OneiosScriptTest {
         assertOk(back)
         assertEquals("return nothing", back.reply.ok)
         // An open session of this boot: the test root starts nothing, and staging is refused.
-        File(f.stage, "session").mkdirs()
-        File(f.stage, "session/boot").writeText("boot-1\n")
-        File(f.stage, "session/state").writeText("running\n")
+        File(f.stage, "control").mkdirs()
+        File(f.stage, "control/boot").writeText("boot-1\n")
+        File(f.stage, "control/state").writeText("running\n")
         assertTrue(f.verb(OneiosRoot.Verb.STATUS).status.sessionOpen)
         assertRefused(f.verb(OneiosRoot.Verb.RETURN), "a session is open")
         assertRefused(f.verb(OneiosRoot.Verb.BEGIN, listOf("image")), "an iOS session is running")
         assertRefused(f.verb(OneiosRoot.Verb.REMOVE), "an iOS session is running")
-        File(f.stage, "session").deleteRecursively()
+        File(f.stage, "control").deleteRecursively()
         // What root recorded: every file with its hash, the manifest included.
         assertEquals(
             setOf("runtime.json", "bin/stub", "bin/xnuhost"),
@@ -347,11 +555,11 @@ class OneiosScriptTest {
         val session = lines.indexOfFirst { it.contains("echo \"=== [1/5]") }
         assertTrue(preflight in 1 until session)
         val before = lines.subList(preflight, session).joinToString("\n")
-        for (change in listOf("ctl.stop", "ctl.start", "kill ", "wake_lock 2", "mkdir", "rm -", "mount --", "unshare -m", "> \"\$SESSION")) {
+        for (change in listOf("ctl.stop", "ctl.start", "kill ", "wake_lock 2", "mkdir", "rm -", "mount --", "unshare -m", "> \"\$SESSION", "> \"\$CTL")) {
             assertFalse("the preflight has '$change'", before.contains(change))
         }
         val after = lines.subList(session, lines.size).joinToString("\n")
-        assertFalse("a refusal after the first change", Regex("""(^|\s)refuse "(?!\${'$'}SESSION is a symlink|could not make)""").containsMatchIn(after))
+        assertFalse("a refusal after the first change", Regex("""(^|\s)refuse "(?!\${'$'}SESSION is a symlink|\${'$'}CTL is a symlink|could not make)""").containsMatchIn(after))
         // The way back is armed before One UI's zygote stops.
         assertTrue(after.indexOf("--watch") in 0 until after.indexOf("setprop ctl.stop zygote"))
         assertTrue(after.indexOf("--keys") in 0 until after.indexOf("setprop ctl.stop zygote"))
@@ -362,15 +570,501 @@ class OneiosScriptTest {
         assertTrue(ret.contains("setprop sys.powerctl \"reboot,\$1\""))
         // A switch that ended before the stop is not a reason to restart One UI's framework or the phone:
         // the stop is marked, and without the mark the return only ends the helpers.
-        assertTrue(after.indexOf("\"\$SESSION/stopped\"") in 0 until after.indexOf("setprop ctl.stop zygote"))
-        val unmarked = ret.indexOf("if [ ! -e \"\$SESSION/stopped\" ]")
+        assertTrue(after.indexOf("\"\$CTL/stopped\"") in 0 until after.indexOf("setprop ctl.stop zygote"))
+        val unmarked = ret.indexOf("if [ ! -e \"\$CTL/stopped\" ]")
         assertTrue(unmarked in 0 until ret.indexOf("Gate A"))
         assertTrue(ret.indexOf("exit 0", unmarked) in unmarked until ret.indexOf("Gate A"))
         // A return with no open session does nothing.
         assertTrue(ret.indexOf("nothing to return from") in 0 until ret.indexOf("kill -TERM"))
     }
 
+
+    // --- The way back to One UI, against a fake phone -------------------------------
+
+    private fun keyEvents(f: Fake, device: String, vararg lines: String) = f.file("events/$device").writeText(lines.joinToString("") { "$it\n" })
+
+    private fun reader(f: Fake, device: String, token: String = TOKEN) = f.start("oneios_switch.sh", "--keys", "/dev/input/$device", token, log = "log/keys-$device")
+
+    /** Volume Up and Volume Down are two devices on the S24 Ultra (gpio-keys and the PMIC's resin key): one reader each. */
+    @Test
+    fun theKeyReadersAskForTheReturnAfterA3sHoldOfBothKeys() = each { f ->
+        // A second of the scripts' clock is 100 ms here: the 3 s hold is 300 ms.
+        f.phone(scale = 10, state = "returning")
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        keyEvents(f, "event0", "EV_KEY       KEY_VOLUMEUP         DOWN", "EV_SYN       SYN_REPORT           00000000")
+        keyEvents(f, "event4", "@ 0.1", "EV_KEY       KEY_VOLUMEDOWN       DOWN", "EV_SYN       SYN_REPORT           00000000")
+        val request = File(f.session, "return.request")
+        reader(f, "event0")
+        reader(f, "event4")
+        await("the request of the key readers") { request.isFile && request.length() > 0 }
+        assertTrue(request.readText(), request.readText().startsWith("keys: Volume Up + Volume Down held 3 s at "))
+        // Each reader listed itself for the return, and neither started the return: the watcher had it (state returning).
+        assertEquals(2, File(f.control, "keys/pids").readLines().size)
+        Thread.sleep(1200)
+        assertEquals("returning", f.state)
+        assertFalse(f.returnLog, f.returnLog.contains("keys:"))
+    }
+
+    @Test
+    fun aShortHoldOrOneKeyAsksForNothing() = each { f ->
+        // The 3 s hold is 1.5 s here; both keys are down for 300 ms, then Volume Up alone stays down.
+        f.phone(scale = 2, state = "returning")
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.3", "EV_KEY KEY_VOLUMEUP UP", "@ 0.3", "EV_KEY KEY_VOLUMEUP DOWN", "EV_KEY KEY_POWER DOWN")
+        keyEvents(f, "event4", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.4", "EV_KEY KEY_VOLUMEDOWN UP")
+        reader(f, "event0")
+        reader(f, "event4")
+        await("both readers have read their events") {
+            File(f.control, "keys/up").takeIf { it.isFile }?.readText()?.trim() == "DOWN" && File(f.control, "keys/down").takeIf { it.isFile }?.readText()?.trim() == "UP"
+        }
+        Thread.sleep(2500)
+        assertFalse(File(f.session, "return.request").exists())
+    }
+
+    /** A key device with auto-repeat reports a held key again and again: that is not a release. Bare values count too. */
+    @Test
+    fun aHeldKeysAutoRepeatDoesNotBreakTheHold() = each { f ->
+        f.phone(scale = 10, state = "returning")
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        val repeats = (1..12).flatMap { listOf("@ 0.05", "EV_KEY KEY_VOLUMEUP REPEAT", "EV_KEY KEY_VOLUMEDOWN 00000002") }
+        keyEvents(f, "event0", *(listOf("EV_KEY KEY_VOLUMEUP DOWN", "EV_KEY KEY_VOLUMEDOWN 00000001") + repeats).toTypedArray())
+        reader(f, "event0")
+        await("the request despite the repeats") { File(f.session, "return.request").isFile }
+    }
+
+    /** A reader of an earlier session (another token) ends on its first event and asks for nothing. */
+    @Test
+    fun aLaterSessionsTokenEndsAnOldReader() = each { f ->
+        f.phone(scale = 10)
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.2", "EV_KEY KEY_VOLUMEDOWN UP", "EV_KEY KEY_VOLUMEDOWN DOWN")
+        val old = reader(f, "event0", token = "an-earlier-session")
+        Thread.sleep(1500)
+        assertFalse(File(f.control, "keys/up").exists() || File(f.control, "keys/down").exists() || File(f.control, "keys/both").exists())
+        assertFalse(File(f.session, "return.request").exists())
+        assertEquals("running", f.state)
+        // Its loop is gone: only its (stand-in) getevent, blocked on a quiet device, keeps the pipeline open.
+        f.file("events/stop").createNewFile()
+        assertTrue(old.waitFor(10, TimeUnit.SECONDS))
+        // On a phone the reader leads its own process group and ends all of it, getevent included.
+        val sw = code(switchScript).joinToString("\n")
+        assertTrue(sw.contains("[ \"\$(cat \"\$KS/session\" 2>/dev/null)\" = \"\$tok\" ] || reader_end"))
+        assertTrue(sw.contains("[ \"\$OWN_GROUP\" = 1 ] && kill -9 -- \"-\$\$\""))
+    }
+
+    /** The keys' state, asked of the devices: what a grab (EVIOCGRAB) by the guest cannot take away. */
+    @Test
+    fun thePollSeesTheChordWithoutAnyEvent() = each { f ->
+        f.phone(scale = 10, state = "returning")
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        fun keys(device: String, vararg down: String) = f.file("keystate/$device").writeText(
+            "add device 1: /dev/input/$device\n  name:     \"keys\"\n  events:\n    KEY (0001): " +
+                listOf("KEY_VOLUMEDOWN", "KEY_VOLUMEUP", "KEY_POWER").joinToString("") { "$it${if (it in down) "*" else " "}       " } + "\n",
+        )
+        // One key down, however long: nothing.
+        keys("event0", "KEY_VOLUMEUP")
+        keys("event4")
+        f.start("oneios_switch.sh", "--keys-poll", TOKEN, "/dev/input/event0", "/dev/input/event4")
+        Thread.sleep(1500)
+        assertFalse(File(f.session, "return.request").exists())
+        // Both down (each on its own device): seven samples, half a second apart, later.
+        keys("event4", "KEY_VOLUMEDOWN")
+        await("the request of the poll") { File(f.session, "return.request").let { it.isFile && it.length() > 0 } }
+        assertTrue(File(f.session, "return.request").readText().startsWith("keys: Volume Up + Volume Down down for 3 s (polled) at "))
+        // No events file was ever read: the poll does not depend on the event stream.
+        assertFalse(f.file("events/event0").exists())
+    }
+
+    /** No watcher (killed, or stuck): five seconds after their request the key readers start the return themselves. */
+    @Test
+    fun withoutAWatcherTheKeysStartTheReturnThemselves() = each { f ->
+        f.phone(scale = 20)
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "EV_KEY KEY_VOLUMEDOWN DOWN")
+        reader(f, "event0")
+        await("One UI back from the key reader alone", 60_000) { f.state == "returned" }
+        assertTrue(f.returnLog, f.returnLog.contains("keys: the watcher did not start the return within 5 s"))
+        assertTrue(f.returnLog, f.returnLog.contains("=== Return to One UI (keys-direct)"))
+        // In a session of its own: the return ends the readers' process groups, and it came from one.
+        assertTrue(f.lines("log/busybox").any { it.startsWith("setsid ") && it.endsWith("oneios_return.sh keys-direct") })
+        f.assertInPlace()
+    }
+
+    private fun watcher(f: Fake, max: Int = 600): Process {
+        val p = f.start("oneios_switch.sh", "--watch", env = mapOf("ONEIOS_RETURN_MAX" to "$max"), log = "data/local/tmp/oneios/return.log")
+        await("the watcher's pid") { File(f.control, "watcher.pid").let { it.isFile && it.readText().trim().toIntOrNull() != null } }
+        return p
+    }
+
+    @Test
+    fun theWatcherReturnsWhenXnuhostEnds() = each { f ->
+        f.phone()
+        val w = watcher(f)
+        Thread.sleep(300)
+        assertEquals("running", f.state)
+        assertEquals(emptyList<String>(), f.setprops)
+        f.ends(XNUHOST)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertEquals(f.returnLog, 0, w.exitValue())
+        assertTrue(f.returnLog, f.returnLog.contains("watcher: xnuhost $XNUHOST ended (last log lines: guest: launchd|); returning to One UI"))
+        assertTrue(f.returnLog, f.returnLog.contains("=== Return to One UI (watcher)"))
+        // xnuhost was gone already: nothing was signalled.
+        assertFalse(f.kills.toString(), f.kills.any { it.contains("$XNUHOST") })
+        f.assertInPlace()
+    }
+
+    @Test
+    fun theWatcherReturnsOnARequest() = each { f ->
+        f.phone()
+        File(f.session, "ready").createNewFile()
+        val w = watcher(f)
+        File(f.session, "return.request").writeText("the guest asked to return\n")
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertTrue(f.returnLog, f.returnLog.contains("watcher: return asked (the guest asked to return); returning to One UI"))
+        // A running xnuhost gets SIGTERM and ends: nothing is killed.
+        assertEquals(listOf("-TERM $XNUHOST"), f.kills)
+        f.assertInPlace()
+    }
+
+    /**
+     * What the way back reads is not in the folder xnuhost writes: a guest that empties its session folder, or leaves
+     * a state of its own there, and ends, is still returned from.
+     */
+    @Test
+    fun aGuestThatWipesItsSessionFolderIsStillReturnedFrom() = each { f ->
+        f.phone()
+        val w = watcher(f)
+        f.session.listFiles()!!.forEach { it.deleteRecursively() }
+        File(f.session, "state").writeText("returned\n")
+        File(f.session, "xnuhost.pid").writeText("1\n")
+        f.ends(XNUHOST)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertTrue(f.returnLog, f.returnLog.contains("watcher: xnuhost $XNUHOST ended"))
+        f.assertInPlace()
+        // In xnuhost's namespace that folder, and the scripts, are read-only.
+        val inner = code(switchScript).joinToString("\n").let { it.substring(it.indexOf("    --inner)"), it.indexOf("    --stop-loop)")) }
+        assertTrue(inner.contains("for d in runtime image control bin oneios_switch.sh oneios_return.sh; do"))
+        assertTrue(inner.contains("the way back's control folder is writable in the session's namespace"))
+    }
+
+    /** iOS never came up: no `ready` within the deadline is a return; with `ready` the session goes on. */
+    @Test
+    fun theWatcherReturnsWhenTheGuestNeverReportsReady() = each { f ->
+        f.phone()
+        val w = watcher(f, max = 30)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertTrue(f.returnLog, f.returnLog.contains("watcher: the guest did not report ready within 30s; returning to One UI"))
+        f.assertInPlace()
+    }
+
+    @Test
+    fun aReadyGuestIsLeftRunningPastTheDeadline() = each { f ->
+        f.phone()
+        File(f.session, "ready").createNewFile()
+        val w = watcher(f, max = 5)
+        // Twenty of the scripts' seconds and more.
+        Thread.sleep(1500)
+        assertTrue(w.isAlive)
+        // It keeps the session's wakelock up meanwhile: nothing else holds the phone awake.
+        assertEquals("oneios_session", f.lines("sys/power/wake_lock").firstOrNull())
+        assertEquals("running", f.state)
+        assertEquals(emptyList<String>(), f.setprops)
+        assertTrue(f.file("proc/$XNUHOST").isDirectory)
+        File(f.session, "return.request").writeText("adb\n")
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        f.assertInPlace()
+    }
+
+    /** The switch never got as far as starting xnuhost: the watcher ends the session; One UI was never stopped. */
+    @Test
+    fun theWatcherEndsASwitchThatNeverStartedXnuhost() = each { f ->
+        f.phone(stopped = false, state = "starting")
+        val w = watcher(f)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertTrue(f.returnLog, f.returnLog.contains("watcher: the switch did not start xnuhost within 60 s; returning to One UI"))
+        assertTrue(f.returnLog, f.returnLog.contains("The switch ended before One UI's framework was stopped: nothing to restore."))
+        assertEquals("returned", f.state)
+        assertEquals(emptyList<String>(), f.setprops)
+    }
+
+    /** A return script that cannot run must still end in One UI: the watcher reboots. */
+    @Test
+    fun theWatcherRebootsWhenTheReturnScriptCannotRun() = each { f ->
+        f.phone()
+        assertTrue(File(f.stage, "oneios_return.sh").delete())
+        val w = watcher(f)
+        f.ends(XNUHOST)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertEquals("reboot,oneios-watcher-failsafe", f.rebooted)
+        assertTrue(f.outcome, f.outcome.startsWith("failsafe ") && f.outcome.contains("oneios_return.sh ended with"))
+        assertTrue(f.lines("log/busybox").contains("reboot -f"))
+    }
+
+    @Test
+    fun theReturnRestoresTheDisplayAndStartsOneUiInPlace() = each { f ->
+        f.phone()
+        // One UI's own daemons change persist properties in a session too: named in the log, never written back.
+        f.file("props").appendText("persist.sys.locale=xx-secret\n")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        assertEquals(listOf("-TERM $XNUHOST"), f.kills)
+        assertFalse(r.text, r.text.contains("xx-secret") || f.lines("log/resetprop").any { it.contains("persist.") })
+        // Every line once, in the log as on the caller's output.
+        assertEquals(f.returnLog, 1, f.returnLog.lines().count { it.contains("One UI restored in place") })
+        for (line in listOf(
+            "SIGTERM to xnuhost $XNUHOST", "Gate A: no session process, the stage mounted nowhere",
+            "persist properties that differ from the switch: persist.sys.locale ",
+            "display: composer $COMPOSER restarted (was 311), surfaceflinger 9001 (was 310; 310 at the switch), boot animation started",
+            "audioserver, cameraserver, media and wificond restarted", "Gate B: display, audio and One UI's services up", "user 0 unlocked after ",
+        )) assertTrue("'$line' is not in:\n${r.text}", r.text.contains(line))
+        // The boot counters went back in memory, and nothing else was written to a property.
+        assertTrue(f.lines("log/resetprop").contains("-n sys.rescue_boot_count 0"))
+        assertFalse(f.setprops.any { it.startsWith("persist.") })
+        // The session's cgroup is gone with it.
+        assertFalse(f.file("sys/fs/cgroup/oneios_session/cgroup.procs").readText().isNotBlank())
+        // A second return finds nothing to do.
+        val again = f.returns()
+        assertEquals(0, again.exit)
+        assertTrue(again.text, again.text.contains("nothing to return from"))
+    }
+
+    /** A wedged xnuhost ignores SIGTERM: everything of the session is killed, and the display still comes back. */
+    @Test
+    fun aKilledSessionStillGetsItsDisplayBack() = each { f ->
+        f.phone()
+        File(f.file("proc/$XNUHOST"), "ignore_term").createNewFile()
+        f.guest(5001, "xnuhost-tasks")
+        // A task that left xnuhost's mount namespace for one of its own: still in its cgroup, and the stage is still its /data.
+        f.guest(5002, "SpringBoard", ns = "mnt:[78]")
+        // And one that left the cgroup too: found by its mount table.
+        f.guest(5003, "backboardd", ns = "mnt:[79]", cgroup = false)
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(r.text, r.text.contains("SIGKILL to what is left of the session: 5000 5001 5002 5003 "))
+        assertEquals(listOf("-TERM 5000", "-9 5000", "-9 5001", "-9 5002", "-9 5003"), f.kills)
+        assertEquals("1", f.lines("sys/fs/cgroup/oneios_session/cgroup.kill").firstOrNull())
+        f.assertInPlace(r.text)
+    }
+
+    /** Where the composer's restart does not take surfaceflinger with it, surfaceflinger is restarted by name. */
+    @Test
+    fun aSurfaceflingerThatOutlivesTheComposerIsRestarted() = each { f ->
+        f.phone()
+        f.behave("sf_survives_composer")
+        val r = f.returns()
+        assertTrue(r.text, f.setprops.indexOf("ctl.restart surfaceflinger") > f.setprops.indexOf("ctl.restart $COMPOSER"))
+        f.assertInPlace(r.text)
+    }
+
+    /** A surfaceflinger that died in the session (a GPU reset) is no reason to reboot: it is started with the composer. */
+    @Test
+    fun aSurfaceflingerThatDiedInTheSessionIsStartedAgain() = each { f ->
+        f.phone()
+        // (And a pid in the cgroup's list that is no process is not one of the session's.)
+        f.file("sys/fs/cgroup/oneios_session/cgroup.procs").appendText("4999\n")
+        f.file("proc/310").deleteRecursively()
+        f.file("pids/surfaceflinger").delete()
+        f.file("services/SurfaceFlinger").delete()
+        val r = f.returns()
+        assertTrue(r.text, r.text.contains("surfaceflinger is not running now, was 310 at the switch (it is restarted below)"))
+        f.assertInPlace(r.text)
+    }
+
+    private fun failsafe(part: String, frameworkStarted: Boolean = false, arrange: (Fake) -> Unit) = each { f ->
+        f.phone()
+        arrange(f)
+        val r = f.returns()
+        assertEquals(r.text, 1, r.exit)
+        f.assertFailsafe(part, frameworkStarted)
+    }
+
+    @Test
+    fun aProcessThatCannotBeKilledIsAReboot() = failsafe("processes still in the session's namespace or cgroup: 5001") { f ->
+        File(f.guest(5001, "xnuhost-tasks"), "unkillable").createNewFile()
+    }
+
+    @Test
+    fun aStageMountLeftInAnotherNamespaceIsAReboot() = failsafe("processes still in the session's namespace or cgroup: 6000") { f ->
+        // Not in xnuhost's namespace nor its cgroup, but the stage is still its /data, and it does not die.
+        File(f.guest(6000, "launchd", ns = "mnt:[90]", cgroup = false), "unkillable").createNewFile()
+    }
+
+    @Test
+    fun aStageMountInInitsNamespaceIsAReboot() = failsafe("the stage is still mounted") { f ->
+        f.file("proc/1/mountinfo").appendText("41 1 254:50 /local/tmp/oneios/image /data/local/tmp/oneios/x rw - f2fs /dev/block/dm-50 rw\n")
+    }
+
+    @Test
+    fun aMountAddedOnOneUisPartitionsIsAReboot() = failsafe("mounts added on One UI's partitions during the session: /system/etc") { f ->
+        f.file("proc/1/mountinfo").appendText("42 1 0:99 / /system/etc rw - tmpfs tmpfs rw\n")
+    }
+
+    @Test
+    fun aVoldThatIsNotTheSwitchsIsAReboot() = failsafe("One UI's vold is 999 now, was 300 at the switch") { f ->
+        f.file("pids/vold").writeText("999\n")
+    }
+
+    @Test
+    fun aChangedSelinuxModeIsAReboot() = failsafe("SELinux is Permissive, was Enforcing") { f -> f.file("selinux").writeText("Permissive\n") }
+
+    @Test
+    fun anotherBootsBaselineIsAReboot() = failsafe("the baseline is another boot's") { f -> File(f.control, "base/boot_id").writeText("boot-0\n") }
+
+    @Test
+    fun aZygoteThatStartedByItselfIsAReboot() = failsafe("One UI's zygote or system_server started before the return was ready") { f ->
+        f.file("props").appendText("init.svc.zygote=running\n")
+    }
+
+    @Test
+    fun aComposerThatDoesNotComeBackIsAReboot() = failsafe("the display composer $COMPOSER did not restart") { f -> f.behave("no_start_$COMPOSER") }
+
+    @Test
+    fun aComposerThatWasNotRestartedIsAReboot() = failsafe("the display composer $COMPOSER did not restart (pid still '311'") { f -> f.behave("no_restart_$COMPOSER") }
+
+    @Test
+    fun aSurfaceflingerThatDoesNotComeBackIsAReboot() = failsafe("One UI's surfaceflinger did not restart") { f -> f.behave("no_start_surfaceflinger") }
+
+    @Test
+    fun aSurfaceflingerThatDoesNotRegisterIsAReboot() = failsafe("One UI's surfaceflinger did not register") { f -> f.behave("sf_not_registered") }
+
+    @Test
+    fun anAudioserverThatDoesNotRegisterIsAReboot() = failsafe("One UI's audioserver did not register") { f -> f.behave("audio_not_registered") }
+
+    @Test
+    fun noSystemServerIsAReboot() = failsafe("One UI's system_server did not start in 60 s", frameworkStarted = true) { f -> f.behave("no_system_server") }
+
+    @Test
+    fun aUserThatNeverUnlocksIsAReboot() = failsafe("user 0 not unlocked within 180 s", frameworkStarted = true) { f -> f.behave("locked") }
+
+    /** A step that never comes back (init does not answer): the return's own guard reboots. */
+    @Test
+    fun aReturnThatHangsIsRebootedByItsGuard() = each { f ->
+        f.phone()
+        f.behave("hang_ctl.start_audioserver")
+        val p = f.start("oneios_return.sh", "manual", env = mapOf("ONEIOS_TEST_GUARD_MAX" to "300"), log = "log/return")
+        await("the guard's reboot", 60_000) { f.rebooted == "reboot,oneios-return-guard" }
+        assertTrue(p.isAlive)
+        assertTrue(f.outcome, f.outcome.startsWith("failsafe ") && f.outcome.contains("the return did not finish within 300s (last step: [3/5] Gate B: One UI's display and services)"))
+        assertTrue(f.returnLog, f.returnLog.contains("GUARD: the return did not finish within 300s"))
+        assertFalse(f.setprops.any { it == "ctl.restart netd" || it == "ctl.start zygote" })
+    }
+
+    /** One return at a time; a lock whose holder is gone does not keep the next return out. */
+    @Test
+    fun aReturnInProgressIsLeftAloneAndADeadOnesLockIsTaken() = each { f ->
+        f.phone()
+        File(f.control, "returning.lock").mkdirs()
+        File(f.control, "returning.lock/pid").writeText("4242\n")
+        f.proc(4242, "sh", cmdline = "/system/bin/sh /data/local/tmp/oneios/oneios_return.sh watcher")
+        var r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(r.text, r.text.contains("another return is already running (pid 4242); leaving it to it"))
+        assertEquals(emptyList<String>(), f.setprops)
+        assertEquals(emptyList<String>(), f.kills)
+        // That return was killed: its pid is gone, or is another program's now.
+        f.proc(4242, "sh", cmdline = "/system/bin/sh /vendor/bin/something.sh")
+        r = f.returns()
+        assertTrue(r.text, r.text.contains("the return that held the lock is gone (pid '4242'): taking over"))
+        f.assertInPlace(r.text)
+    }
+
+    /**
+     * Without a readable state there is nothing to return from, and never a reboot: except for the watcher and the
+     * key readers, which exist only in a session, when One UI's framework is down as well.
+     */
+    @Test
+    fun aSessionWhoseStateIsGoneIsARebootOnlyForTheWatcherAndTheKeys() = each { f ->
+        f.phone()
+        assertTrue(File(f.control, "state").delete())
+        var r = f.returns("manual")
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(r.text, r.text.contains("nothing to return from"))
+        assertEquals(emptyList<String>(), f.setprops)
+        assertEquals(emptyList<String>(), f.kills)
+        r = f.returns("watcher")
+        assertEquals(r.text, 1, r.exit)
+        assertEquals("reboot,oneios-inplace-failsafe", f.rebooted)
+        assertTrue(f.outcome, f.outcome.contains("the session's state cannot be read"))
+        assertEquals(emptyList<String>(), f.kills)
+    }
+
+    /** ...and with One UI's framework running, not even for them. */
+    @Test
+    fun aMissingStateWithOneUiRunningIsNothing() = each { f ->
+        f.phone()
+        assertTrue(File(f.control, "state").delete())
+        f.file("props").appendText("init.svc.zygote=running\n")
+        val r = f.returns("keys-direct")
+        assertEquals(r.text, 0, r.exit)
+        assertEquals(emptyList<String>(), f.setprops)
+    }
+
+    @Test
+    fun theRebootReturnNeedsNoSession() = each { f ->
+        f.phone()
+        f.session.deleteRecursively()
+        f.control.deleteRecursively()
+        val r = f.returns("reboot")
+        assertEquals(r.text, 1, r.exit)
+        assertEquals("reboot,oneios-return", f.rebooted)
+        assertTrue(f.outcome, f.outcome.startsWith("reboot "))
+        assertEquals(emptyList<String>(), f.kills)
+    }
+
+    /** What the way back rests on, on the scripts' text: it is armed first, apart from the guest, and never grabs a key. */
+    @Test
+    fun theWayBackIsArmedApartFromTheGuest() {
+        val lines = code(switchScript)
+        val sw = lines.joinToString("\n")
+        // Reading the keys never takes them from anyone (no grab; the word is only in comments), by events and by state.
+        assertFalse(sw.contains("EVIOCGRAB"))
+        assertTrue(sw.contains("getevent -lq \"\$kd\"") && sw.contains("getevent -pl \"\$kd\""))
+        assertTrue(sw.contains("*\"KEY_VOLUMEUP*\"*") && sw.contains("*\"KEY_VOLUMEDOWN*\"*"))
+        val session = sw.substring(sw.indexOf("echo \"=== [1/5]"))
+        val stop = session.indexOf("setprop ctl.stop zygote")
+        val xnuhost = session.indexOf("unshare -m")
+        // The watcher, the readers and the poll start in sessions of their own before xnuhost's namespace exists.
+        for (mode in listOf("--watch", "--keys \"\$kd\"", "--keys-poll")) {
+            val at = session.indexOf("\"\$BB\" setsid \$SH \"\$SELF\" $mode")
+            assertTrue(mode, at in 0 until stop && at < xnuhost)
+        }
+        // The wakelock, and the check that all of it runs, come before the stop; a way back that is not armed stops nothing.
+        assertTrue(session.indexOf("echo oneios_session > /sys/power/wake_lock") in 0 until stop)
+        val notArmed = session.indexOf("if [ -n \"\$armed\" ]; then")
+        assertTrue(notArmed in 0 until stop && session.indexOf("exit 4", notArmed) in notArmed until stop)
+        for (check in listOf("the watcher is not running", "key readers started", "is not running", "the wakelock oneios_session is not held")) {
+            assertTrue(check, session.indexOf(check) in 0 until notArmed)
+        }
+        // The watcher and the readers leave for the root cgroup and are exempt from the OOM killer; xnuhost gets a
+        // cgroup of its own and is what the kernel ends first.
+        val out = sw.substring(sw.indexOf("out_of_the_way() {"), sw.indexOf("ask_return() {"))
+        assertTrue(out.contains("\"\$T/sys/fs/cgroup/cgroup.procs\"") && out.contains("echo -1000"))
+        val watch = sw.substring(sw.indexOf("    --watch)"), sw.indexOf("    session|--check) ;;"))
+        assertTrue(watch.contains("out_of_the_way") && watch.contains("awake") && watch.contains("hard_reboot oneios-watcher-failsafe"))
+        val inner = sw.substring(sw.indexOf("    --inner)"), sw.indexOf("    --stop-loop)"))
+        assertTrue(inner.contains("CG=/sys/fs/cgroup/oneios_session") && inner.contains("echo \$\$ > \"\$CG/cgroup.procs\""))
+        assertTrue(inner.contains("echo 500 > /proc/\$\$/oom_score_adj"))
+        assertTrue(inner.indexOf("oom_score_adj") < inner.indexOf("exec \"/data/runtime/\$R_XNUHOST\""))
+        // The return: the guard is armed before the first step, the display comes back before One UI's zygote, and
+        // the reboot has its two last resorts.
+        val ret = code(returnScript).joinToString("\n")
+        assertTrue(ret.indexOf("--guard \"\$GTOK\"") in 0 until ret.indexOf("step \"[1/5]"))
+        val display = ret.indexOf("setprop ctl.restart \"\$COMPOSER_SVC\"")
+        assertTrue(display in ret.indexOf("Gate A") until ret.indexOf("setprop ctl.restart netd"))
+        assertTrue(ret.indexOf("setprop ctl.start bootanim") in display until ret.indexOf("setprop ctl.restart netd"))
+        assertTrue(ret.contains("\"\$BB\" reboot -f") && ret.contains("echo b > \"\$P/sysrq-trigger\""))
+        // Nothing is unmounted by the return, in any namespace.
+        assertFalse(ret.contains("umount"))
+    }
+
     private companion object {
+        const val XNUHOST = 5000
+        const val INIT_NS = "mnt:[1]"
+        const val GUEST_NS = "mnt:[77]"
+        const val COMPOSER = "vendor.qti.hardware.display.composer"
+        const val TOKEN = "4242.1700000000"
+
         /** A 64-byte arm64 ELF header: "\u007fELF", 64-bit, e_machine 0xb7. */
         val ELF: ByteArray = ByteArray(64).also {
             byteArrayOf(0x7f, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte(), 2, 1, 1).copyInto(it)

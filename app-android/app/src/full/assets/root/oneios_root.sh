@@ -86,7 +86,7 @@ find_bb() {
 # A session of this boot that has not returned, or an xnuhost still alive in
 # the namespace the switch recorded.
 session_open() {
-    s="$STAGE/session"
+    s="$STAGE/control"
     if [ "$(cat "$s/boot" 2>/dev/null)" = "$(boot_id)" ]; then
         case "$(cat "$s/state" 2>/dev/null)" in starting|running|returning) return 0 ;; esac
     fi
@@ -121,7 +121,7 @@ do_status() {
     else
         say "@@RESULT image none"
     fi
-    st=$(cat "$STAGE/session/state" 2>/dev/null)
+    st=$(cat "$STAGE/control/state" 2>/dev/null)
     if session_open; then say "@@RESULT session open ${st:-running}"; else say "@@RESULT session none ${st:-never}"; fi
     o=$(head -n 1 "$STAGE/return.outcome" 2>/dev/null | cut -c1-200)
     case "$o" in inplace\ *|failsafe\ *|reboot\ *) say "@@RESULT outcome $o" ;; *) say "@@RESULT outcome none" ;; esac
@@ -182,7 +182,9 @@ do_receive() {
     is_dec "$bytes" || usage "receive: size '$bytes'"
     is_hex64 "$sum" || usage "receive: SHA-256"
     case "$mode" in 0644|0755) ;; *) usage "receive: mode '$mode'" ;; esac
-    [ "$bytes" -le $RECEIVE_MAX ] || refuse "$path is too large"
+    # Not the shell's own comparison: Android's sh (mksh) counts in 32 bits,
+    # and a limit of 16 GiB read as 0 there, so every file was "too large".
+    awk -v b="$bytes" -v m="$RECEIVE_MAX" 'BEGIN { exit !(b + 0 <= m + 0) }' || refuse "$path is too large"
     stage_ok
     session_open && refuse "an iOS session is running: return to One UI first"
     n="$STAGE/$kind.new"

@@ -109,6 +109,11 @@ jobs:
       - name: Guest app
         run: scripts/build-guest-manager.sh --debug
 
+      # Android's /system/bin/sh is mksh, and it counts in 32 bits. The script tests (TestShell, OneiosScriptTest) run
+      # under it too when it is installed; without it they run under dash alone.
+      - name: mksh for the script tests
+        run: sudo apt-get install -y --no-install-recommends mksh || echo "::warning::mksh could not be installed; the script tests run under dash only"
+
       - name: Unit tests
         working-directory: app-android
         run: ./gradlew --max-workers=3 :core:model:test :core:safety:test :core:root:testDebugUnitTest
