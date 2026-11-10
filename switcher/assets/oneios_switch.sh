@@ -612,6 +612,12 @@ getprop > "$B/props"
 for n in vold keystore2 surfaceflinger servicemanager; do echo "$n $(pidof $n 2>/dev/null | tr ' ' ',')"; done > "$B/pids"
 case "$(settings get global wifi_on 2>/dev/null)" in 1|2) echo 1 ;; *) echo 0 ;; esac > "$B/wifi_on"
 awk '{ print $5 }' /proc/1/mountinfo | sort > "$B/mounts"
+# The panel's brightness as One UI has it: xnuhost's brightness bridge writes
+# the backlight node, and a session it cannot end itself (SIGKILL) would leave
+# iOS's last level, possibly the dimmest. The return writes these back.
+for bl in "$T"/sys/class/backlight/*/brightness; do
+    [ -f "$bl" ] && echo "${bl#"$T"} $(cat "$bl" 2>/dev/null)"
+done > "$B/backlight" 2>/dev/null
 echo "Baseline: boot $(cat "$B/boot_id"), SELinux $(cat "$B/selinux"), $(tr '\n' ' ' < "$B/pids")wifi $(cat "$B/wifi_on")"
 
 echo "=== [2/5] $(date +%T) Arming the way back ==="

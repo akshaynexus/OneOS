@@ -312,6 +312,15 @@ end_display() {
 }
 end_display
 
+# One UI's panel brightness from the switch's baseline: xnuhost is gone by here,
+# so nothing writes the node any more. Only a backlight node, only a number;
+# a missing or unwritable node is logged and never stops the return.
+while read -r bl lv; do
+    case "$bl" in /sys/class/backlight/*/brightness) ;; *) continue ;; esac
+    case "$lv" in ''|*[!0-9]*) continue ;; esac
+    if echo "$lv" > "$T$bl" 2>/dev/null; then say "backlight: $bl back to $lv"; else say "backlight: $bl could not be written back (logged only)"; fi
+done < "$CTL/base/backlight" 2>/dev/null
+
 # The switch ended before it stopped One UI's zygote (it marks the stop):
 # One UI never went away, so there is nothing to check or start. Its helpers
 # end, and that is the whole return.
