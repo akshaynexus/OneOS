@@ -87,6 +87,10 @@ if [ "$WHO" = reboot ]; then
     do_reboot oneios-return
 fi
 
+# A session that already returned, or none: nothing to do, and never a reboot.
+case "$(cat "$SESSION/state" 2>/dev/null)" in
+    ''|returned) say "no open session (state '$(cat "$SESSION/state" 2>/dev/null)'): nothing to return from"; exit 0 ;;
+esac
 # One return at a time: the watcher and a manual return can meet.
 if ! mkdir "$SESSION/returning.lock" 2>/dev/null; then
     [ -d "$SESSION" ] || { say "no session folder: nothing to return from"; exit 0; }
@@ -129,6 +133,22 @@ if [ -n "$left" ]; then
         for p in $(in_session); do kill -9 "$p" 2>/dev/null; done
         sleep 0.2; n=$((n + 1))
     done
+fi
+
+# The switch ended before it stopped One UI's zygote (it marks the stop):
+# One UI never went away, so there is nothing to check or start. Its helpers
+# end, and that is the whole return.
+if [ ! -e "$SESSION/stopped" ]; then
+    : > "$SESSION/stop-loop.off"
+    : > "$SESSION/feeder.off"
+    end_helper "$SESSION/stop-loop.pid" --stop-loop
+    end_helper "$SESSION/feeder.pid" --feed
+    echo returned > "$SESSION/state"
+    echo "inplace $(date +%s) One UI was never stopped" > "$S/return.outcome"
+    echo oneios_session > /sys/power/wake_unlock 2>/dev/null
+    echo oneios_return > /sys/power/wake_unlock 2>/dev/null
+    say "The switch ended before One UI's framework was stopped: nothing to restore."
+    exit 0
 fi
 
 echo "=== [2/4] $(date +%T) Gate A: nothing of the session is left ==="

@@ -347,6 +347,14 @@ class OneiosScriptTest {
         assertTrue(ret.indexOf("Gate A") in 0 until ret.indexOf("setprop ctl.start zygote"))
         assertTrue(ret.contains("failsafe \"processes still in the session's namespace"))
         assertTrue(ret.contains("setprop sys.powerctl \"reboot,\$1\""))
+        // A switch that ended before the stop is not a reason to restart One UI's framework or the phone:
+        // the stop is marked, and without the mark the return only ends the helpers.
+        assertTrue(after.indexOf("\"\$SESSION/stopped\"") in 0 until after.indexOf("setprop ctl.stop zygote"))
+        val unmarked = ret.indexOf("if [ ! -e \"\$SESSION/stopped\" ]")
+        assertTrue(unmarked in 0 until ret.indexOf("Gate A"))
+        assertTrue(ret.indexOf("exit 0", unmarked) in unmarked until ret.indexOf("Gate A"))
+        // A return with no open session does nothing.
+        assertTrue(ret.indexOf("nothing to return from") in 0 until ret.indexOf("kill -TERM"))
     }
 
     private companion object {

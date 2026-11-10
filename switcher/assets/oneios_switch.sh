@@ -443,6 +443,9 @@ for p in $(pidof system_server); do
         case "$t" in /dev/watchdog*|/dev/softdog*) echo "$t" ;; esac
     done
 done 2>/dev/null | sort -u > "$SESSION/softdog_nodes"
+# From here One UI's framework is down: the return starts it again. Without
+# this mark the return only tidies up (a switch that ended before the stop).
+echo "$(date +%s)" > "$SESSION/stopped"
 setprop ctl.stop zygote
 [ -n "$(getprop init.svc.zygote_secondary)" ] && setprop ctl.stop zygote_secondary
 n=0

@@ -107,7 +107,9 @@ no process in that namespace, nothing mounted under the stage or added on One UI
 vold, keystore2, surfaceflinger and servicemanager with their pids of the switch, SELinux as it was. Gate B: the
 stop loop gone, One UI's boot-loop counters back to the switch's (in memory), zygote started. Gate C:
 system_server keeps its pid until user 0 is unlocked and 20 s more. A failed check is the failsafe: a reboot.
-`oneios_return.sh reboot` goes straight there.
+`oneios_return.sh reboot` goes straight there. A return with no open session does nothing, and a switch that
+ended before it stopped One UI's zygote (the stop is marked in `session/stopped`) only has its helpers ended:
+neither restarts anything.
 
 ## One UI's data guards
 
