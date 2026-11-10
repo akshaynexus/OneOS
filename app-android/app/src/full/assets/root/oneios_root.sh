@@ -29,11 +29,21 @@
 #                               in init's mount namespace. With no open session
 #                               that script does nothing
 #   remove                      delete the stage (never during a session)
+#   check <id>                  one hardware check (docs/oneios.md, "Hardware
+#                               checks"): a phone tool of the staged runtime's
+#                               bin/, run beside One UI with a time limit; a
+#                               tool that has not finished is ended and what it
+#                               changed is put back. Never during a session
+#   uncheck <id>                the put-back step of <id> alone, for a check
+#                               whose root command the app had to end
+#   checkfile <id>              the picture a camera check wrote, in base64
 #
 # Writes: only under $STAGE (/data/local/tmp/oneios), which is root's, mode
 # 0700, and separate from OneOS's Android stage. Nothing of One UI's data, no
 # property, no SELinux change. switch starts oneios_switch.sh; what that does
-# is written at its top.
+# is written at its top. The one exception is check's put-back step: the
+# panel's backlight level and the light sensor's enable file, written back to
+# the values read before the tool ran.
 umask 077
 T="${ONEIOS_TEST_ROOT:-}"
 if [ -n "$T" ]; then
@@ -350,6 +360,172 @@ do_remove() {
     say "@@OK remove"
 }
 
+# --- Hardware checks ----------------------------------------------------------
+# OneiOS's phone tools (its runtime's bin/), each alone, as root, beside a
+# running One UI. Nothing here stops or starts a service, a session or a
+# process of One UI's; the tools' own READMEs in OneiOS say what each touches.
+# The table is the same as OneiosChecks.ALL in the app (a test compares them).
+CHECKS="$STAGE/checks"
+check_cmd() { # <id>: TOOL (a file of the runtime's bin/), ARGS, LIMIT in seconds
+    R="$STAGE/runtime/bin"
+    case "$1" in
+        cpu) TOOL=bridgectl ARGS="cpu" LIMIT=15 ;;
+        gpu) TOOL=gpuctl ARGS="" LIMIT=30 ;;
+        display) TOOL=displayctl ARGS="test" LIMIT=30 ;;
+        haptic) TOOL=bridgectl ARGS="haptic 200 1000" LIMIT=10 ;;
+        haptic-pattern) TOOL=bridgectl ARGS="haptic-pattern" LIMIT=15 ;;
+        audio) TOOL=bridgectl ARGS="audio $R/oneios-audio" LIMIT=20 ;;
+        bt) TOOL=bridgectl ARGS="bt" LIMIT=45 ;;
+        brightness) TOOL=brightctl ARGS="info" LIMIT=10 ;;
+        levels) TOOL=brightctl ARGS="levels" LIMIT=30 ;;
+        als) TOOL=brightctl ARGS="als 10" LIMIT=25 ;;
+        camera-list) TOOL=camctl ARGS="--backend ndk list" LIMIT=30 ;;
+        camera) TOOL=camctl ARGS="--backend ndk --camera wide --frames 90 --out $CHECKS/camera.png capture" LIMIT=45 ;;
+        camera-hal-list) TOOL=camctl ARGS="--backend hal list" LIMIT=30 ;;
+        camera-hal) TOOL=camctl ARGS="-v --backend hal --camera wide --frames 90 --out $CHECKS/camera-hal.png capture" LIMIT=45 ;;
+        *) usage "check: '$1' is not a hardware check" ;;
+    esac
+}
+# Is <pid> still the tool this check started (not another process that got its number)?
+check_is_tool() { grep -q -F "$STAGE/runtime/bin/$TOOL" "/proc/$1/cmdline" 2>/dev/null; }
+# What a check may change, read before its tool runs.
+check_save() { # <id>
+    : > "$CHECKS/saved.backlight"
+    : > "$CHECKS/saved.als"
+    case "$1" in
+        levels)
+            for d in "$T"/sys/class/backlight/*; do
+                [ -r "$d/brightness" ] && echo "${d##*/} $(cat "$d/brightness")"
+            done > "$CHECKS/saved.backlight" ;;
+    esac
+    case "$1" in
+        brightness|levels|als)
+            for d in "$T"/sys/class/input/event*; do
+                [ "$(cat "$d/device/name" 2>/dev/null)" = als_rear ] && [ -r "$d/device/enable" ] && echo "${d##*/} $(cat "$d/device/enable")"
+            done > "$CHECKS/saved.als" ;;
+    esac
+}
+# The put-back step, for a tool that was ended before it could do its own: the
+# tool and its helpers are gone, the backlight has the level and the light
+# sensor the enable value read before the tool ran, the display test's layer
+# and folder are removed.
+check_restore() { # <id>
+    if [ -z "$T" ]; then
+        pkill -9 -f "$STAGE/runtime/bin/$TOOL" 2>/dev/null
+        case "$1" in
+            display) pkill -f OneiOSDisplay 2>/dev/null; pkill -9 -f "$STAGE/runtime/bin/oneios-display" 2>/dev/null ;;
+            audio) pkill -9 -f "$STAGE/runtime/bin/oneios-audio" 2>/dev/null ;;
+            camera*) pkill -9 -f "$STAGE/runtime/bin/oneios-camera" 2>/dev/null ;;
+        esac
+    fi
+    # displayctl's own folder (its socket), left by a killed display test.
+    for d in "$CHECKS"/displayctl.??????; do
+        [ -d "$d" ] && [ ! -L "$d" ] && unlink "$d/display.sock" 2>/dev/null
+        [ -d "$d" ] && [ ! -L "$d" ] && rmdir "$d" 2>/dev/null
+    done
+    if [ -f "$CHECKS/saved.backlight" ] && [ ! -L "$CHECKS/saved.backlight" ]; then
+        while read -r name value; do
+            case "$name" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+            is_dec "$value" || continue
+            n="$T/sys/class/backlight/$name/brightness"
+            [ -w "$n" ] && echo "$value" > "$n" && say "@@INFO put back: backlight $name $value"
+        done < "$CHECKS/saved.backlight"
+    fi
+    if [ -f "$CHECKS/saved.als" ] && [ ! -L "$CHECKS/saved.als" ]; then
+        while read -r name value; do
+            case "$name" in event[0-9]*) ;; *) continue ;; esac
+            case "$name" in *[!a-z0-9]*) continue ;; esac
+            case "$value" in 0|1) ;; *) continue ;; esac
+            n="$T/sys/class/input/$name/device/enable"
+            [ -w "$n" ] && echo "$value" > "$n" && say "@@INFO put back: light sensor $name enable $value"
+        done < "$CHECKS/saved.als"
+    fi
+    : > "$CHECKS/saved.backlight"
+    : > "$CHECKS/saved.als"
+    [ ! -e "$CHECKS/timeout" ] || unlink "$CHECKS/timeout"
+}
+checks_dir() {
+    [ ! -L "$CHECKS" ] || refuse "$CHECKS is a link"
+    [ -d "$CHECKS" ] || mkdir "$CHECKS" || die "could not make $CHECKS"
+    own "$CHECKS" 0700 || die "could not make $CHECKS root's"
+}
+
+do_check() {
+    [ $# -eq 1 ] || usage "check <id>"
+    id=$1
+    check_cmd "$id"
+    stage_ok
+    session_open && refuse "an iOS session is running: the hardware checks only run beside One UI"
+    [ -f "$STAGE/runtime.conf" ] && mine "$STAGE/runtime.conf" && [ -d "$STAGE/runtime" ] || refuse "no OneiOS runtime is staged: the checks are its tools"
+    [ -n "$T" ] || [ "$(getprop sys.boot_completed 2>/dev/null)" = 1 ] || refuse "One UI is not fully up"
+    bin="$STAGE/runtime/bin/$TOOL"
+    if [ ! -f "$bin" ] || [ -L "$bin" ] || [ ! -x "$bin" ]; then
+        say "@@RESULT check $id missing $TOOL"
+        say "@@OK check $id"
+        return
+    fi
+    # Only the file root hashed when the runtime was staged.
+    want=$(awk -v p="bin/$TOOL" '$2 == p { print $1 }' "$STAGE/runtime.sha256" 2>/dev/null | head -n 1)
+    [ -n "$want" ] && [ "$(sha "$bin")" = "$want" ] || refuse "bin/$TOOL is not the file that was staged: stage the runtime again"
+    checks_dir
+    limit=$LIMIT
+    if [ -n "$T" ] && is_dec "${ONEIOS_CHECK_LIMIT:-x}"; then limit=$ONEIOS_CHECK_LIMIT; fi
+    log="$CHECKS/$id.log"
+    : > "$log"
+    [ ! -e "$CHECKS/timeout" ] || unlink "$CHECKS/timeout"
+    [ ! -e "$CHECKS/$id.png" ] || unlink "$CHECKS/$id.png"
+    check_save "$id"
+    # The tool, with nothing on its stdin and its temporary files in the stage.
+    TMPDIR="$CHECKS" "$bin" $ARGS > "$log" 2>&1 < /dev/null &
+    pid=$!
+    # The time limit: SIGTERM (the tools put back what they changed on it), 2 s, SIGKILL.
+    (
+        sleep "$limit"
+        check_is_tool "$pid" || exit 0
+        : > "$CHECKS/timeout"
+        kill -TERM "$pid" 2>/dev/null
+        sleep 2
+        check_is_tool "$pid" && kill -KILL "$pid" 2>/dev/null
+    ) < /dev/null > /dev/null 2>&1 &
+    dog=$!
+    wait "$pid"
+    rc=$?
+    kill "$dog" 2>/dev/null
+    timed=0
+    [ ! -e "$CHECKS/timeout" ] || timed=1
+    head -c 262144 "$log" | sed 's/^/| /'
+    if [ $timed = 1 ]; then
+        check_restore "$id"
+        say "@@RESULT check $id timeout $limit"
+    else
+        say "@@RESULT check $id exit $rc"
+    fi
+    say "@@OK check $id"
+}
+
+do_uncheck() {
+    [ $# -eq 1 ] || usage "uncheck <id>"
+    check_cmd "$1"
+    stage_ok
+    session_open && refuse "an iOS session is running"
+    [ -d "$CHECKS" ] && [ ! -L "$CHECKS" ] && mine "$CHECKS" || { say "@@OK uncheck nothing"; return; }
+    check_restore "$1"
+    say "@@OK uncheck $1"
+}
+
+do_checkfile() {
+    [ $# -eq 1 ] || usage "checkfile <id>"
+    case "$1" in camera|camera-hal) ;; *) usage "checkfile: '$1' has no picture" ;; esac
+    stage_ok
+    f="$CHECKS/$1.png"
+    [ -d "$CHECKS" ] && [ ! -L "$CHECKS" ] && mine "$CHECKS" && [ -f "$f" ] && [ ! -L "$f" ] || refuse "the check left no picture"
+    size=$(stat -c %s "$f" 2>/dev/null)
+    is_dec "$size" && [ "$size" -ge 1 ] && [ "$size" -le 8388608 ] || refuse "the picture is empty or larger than 8 MiB"
+    say "@@RESULT file $1 $size $(sha "$f")"
+    base64 "$f" | sed 's/^/| /'
+    say "@@OK checkfile $1"
+}
+
 [ -n "$T" ] || [ "$(id -u)" = 0 ] || refuse "not root"
 verb=${1:-}
 [ $# -gt 0 ] && shift
@@ -362,5 +538,8 @@ case "$verb" in
     switch) do_switch "$@" ;;
     return) do_return "$@" ;;
     remove) do_remove "$@" ;;
-    *) usage "oneios_root.sh status|begin|receive|script|finish|switch|return|remove" ;;
+    check) do_check "$@" ;;
+    uncheck) do_uncheck "$@" ;;
+    checkfile) do_checkfile "$@" ;;
+    *) usage "oneios_root.sh status|begin|receive|script|finish|switch|return|remove|check|uncheck|checkfile" ;;
 esac

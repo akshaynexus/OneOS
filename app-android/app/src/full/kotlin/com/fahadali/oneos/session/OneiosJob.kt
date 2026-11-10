@@ -66,7 +66,7 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
     @Volatile private var connection: HttpURLConnection? = null
 
     private fun othersBusy() = StageCheck.state.busy || PrepareJob.state.busy || LaunchJob.state.busy || LogJob.state.busy ||
-        OldStagesJob.state.busy || RemoveJob.state.busy
+        OldStagesJob.state.busy || RemoveJob.state.busy || OneiosChecksJob.state.busy
 
     fun canStart(): Boolean = !state.busy && !othersBusy()
 
@@ -90,7 +90,7 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
     }
 
     /** The root script, exactly the pinned bytes. */
-    private fun rootScript(app: Context): ByteArray {
+    internal fun rootScript(app: Context): ByteArray {
         val b = app.assets.open(OneiosRoot.ASSET).use { it.readBytes() }
         if (b.size.toLong() != BuildConfig.ONEIOS_ROOT_BYTES || Hashes.sha256(b) != BuildConfig.ONEIOS_ROOT_SHA256) {
             throw Failed("the OneiOS root script in the app is not the pinned one")

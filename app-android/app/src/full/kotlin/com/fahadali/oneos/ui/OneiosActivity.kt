@@ -149,6 +149,11 @@ class OneiosActivity : EdgeToEdgeActivity() {
             "reboot" -> PrebootCards.row(session, getString(R.string.oneios_last_return_reboot))
         }
 
+        // Hardware checks: OneiOS's phone tools beside One UI, a screen of its own.
+        PrebootCards.row(PrebootCards.section(list), getString(R.string.oneios_checks), getString(R.string.oneios_checks_line), chevron = true) {
+            startActivity(OneiosChecksActivity.intent(this))
+        }
+
         // The experimental tick: asked every time, as for a phone a system was never tested on.
         val box = AppCompatCheckBox(this).apply {
             text = getString(R.string.oneios_ack)

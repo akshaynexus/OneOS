@@ -1,6 +1,8 @@
 package com.fahadali.oneos.core.root
 
 import com.fahadali.oneos.core.model.Hashes
+import com.fahadali.oneos.core.model.OneiosCheckOutcome
+import com.fahadali.oneos.core.model.OneiosChecks
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -83,10 +85,11 @@ class OneiosScriptTest {
             val status: OneiosStatus get() = OneiosStatus.parse(reply.results)
         }
 
-        fun verb(verb: OneiosRoot.Verb, args: List<String> = emptyList(), data: ByteArray? = null): Out {
+        fun verb(verb: OneiosRoot.Verb, args: List<String> = emptyList(), data: ByteArray? = null, env: Map<String, String> = emptyMap()): Out {
             val cmd = OneiosRoot.launcher(verb, args, Hashes.sha256(script), script.size.toLong(), layout)
             val pb = ProcessBuilder(sh, "-c", cmd).redirectErrorStream(true)
             pb.environment()["ONEIOS_TEST_ROOT"] = root.path
+            pb.environment().putAll(env)
             val p = pb.start()
             val input = when (verb.stdin) {
                 OneiosRoot.Stdin.SCRIPT -> script
@@ -1056,6 +1059,190 @@ class OneiosScriptTest {
         assertTrue(ret.contains("\"\$BB\" reboot -f") && ret.contains("echo b > \"\$P/sysrq-trigger\""))
         // Nothing is unmounted by the return, in any namespace.
         assertFalse(ret.contains("umount"))
+    }
+
+    // --- Hardware checks: the check runner, with stand-ins for OneiOS's tools ----------
+
+    /** Stages a runtime whose bin/ holds [tools] (shell scripts standing in for OneiOS's phone tools). */
+    private fun runtimeWith(f: Fake, tools: Map<String, String>) {
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("runtime")))
+        assertOk(f.receive("runtime", "runtime.json", "{}".toByteArray()))
+        assertOk(f.receive("runtime", "bin/xnuhost", ELF, "0755"))
+        for ((name, body) in tools) assertOk(f.receive("runtime", "bin/$name", "#!/bin/sh\n$body\n".toByteArray(), "0755"))
+        assertOk(f.verb(OneiosRoot.Verb.FINISH, listOf("runtime", (tools.size + 2).toString(), "0.1.0", "1", "bin/xnuhost", "1", "0")))
+    }
+
+    private fun checkRun(f: Fake, id: String, limit: Int? = null): Pair<Fake.Out, OneiosChecks.Run?> {
+        val o = f.verb(OneiosRoot.Verb.CHECK, listOf(id), env = limit?.let { mapOf("ONEIOS_CHECK_LIMIT" to it.toString()) }.orEmpty())
+        return o to OneiosChecks.parseRun(id, o.reply.results, o.text.lines())
+    }
+
+    /** The script's table of checks is the app's: the same tool, arguments and time limit for every id. */
+    @Test
+    fun theScriptsChecksAreTheApps() {
+        val text = rootScript.readText()
+        for (c in OneiosChecks.ALL) {
+            val args = c.args.replace("@BIN@", "\$R").replace("@OUT@", "\$CHECKS")
+            val line = "        ${c.id}) TOOL=${c.tool} ARGS=\"$args\" LIMIT=${c.limitSeconds} ;;\n"
+            assertTrue("oneios_root.sh lacks: $line", text.contains(line))
+        }
+        assertEquals(OneiosChecks.ALL.size, Regex("""(?m)^        [a-z-]+\) TOOL=""").findAll(text).count())
+        // Only these ids reach the launcher, and only the camera checks have a picture.
+        assertEquals(emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.CHECK, listOf("gpu")))
+        assertEquals(emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.UNCHECK, listOf("levels")))
+        assertEquals(emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.CHECKFILE, listOf("camera")))
+        assertTrue(OneiosRoot.problems(OneiosRoot.Verb.CHECK, listOf("reboot")).isNotEmpty())
+        assertTrue(OneiosRoot.problems(OneiosRoot.Verb.CHECK, listOf("gpu", "-v")).isNotEmpty())
+        assertTrue(OneiosRoot.problems(OneiosRoot.Verb.CHECK, emptyList()).isNotEmpty())
+        assertTrue(OneiosRoot.problems(OneiosRoot.Verb.CHECKFILE, listOf("gpu")).isNotEmpty())
+    }
+
+    /** The checks never stop or start anything of One UI's, never start a session, and write outside the stage only to put back. */
+    @Test
+    fun theChecksLeaveOneUiAlone() {
+        val lines = code(rootScript)
+        val from = lines.indexOfFirst { it.startsWith("CHECKS=") }
+        val to = lines.indexOfFirst { it.contains("refuse \"not root\"") }
+        assertTrue(from in 1 until to)
+        val checks = lines.subList(from, to).joinToString("\n") { it.replace(Regex(""" # .*$"""), "") }
+        for (never in listOf("setprop", "ctl.stop", "ctl.start", "ctl.restart", "zygote", "oneios_switch.sh", "oneios_return.sh", "nsenter", "mount", "reboot",
+            "am ", "svc ", "settings put", "/data/data", "/sdcard", "rm -rf", "rm -r")) {
+            assertFalse("the checks have '$never'", checks.contains(never))
+        }
+        // Every write goes under the checks folder, except the two put-back writes.
+        val writes = Regex("""(?<![0-9&])>>?\s*("?[^\s;&|)]+)""").findAll(checks).map { it.groupValues[1].trim('"') }
+            .filterNot { it.isEmpty() || it == "/dev/null" || it.startsWith("&") }.toSet()
+        assertEquals(setOf("\$CHECKS/saved.backlight", "\$CHECKS/saved.als", "\$n", "\$log", "\$CHECKS/timeout"), writes)
+        assertTrue(checks.contains("n=\"\$T/sys/class/backlight/\$name/brightness\"") && checks.contains("n=\"\$T/sys/class/input/\$name/device/enable\""))
+        // Only processes of the runtime's own bin/, or the display test's layer, are ever ended by name.
+        for (kill in Regex("""pkill [^\n;]*""").findAll(checks).map { it.value }) {
+            assertTrue(kill, kill.contains("\"\$STAGE/runtime/bin/") || kill.contains("OneiOSDisplay"))
+        }
+        assertTrue(checks.contains("session_open && refuse \"an iOS session is running: the hardware checks only run beside One UI\""))
+    }
+
+    @Test
+    fun aCheckRunsTheStagedToolAndReportsItsOutputAndExitCode() = each { f ->
+        // No stage, then no runtime: refused, nothing run.
+        assertRefused(f.verb(OneiosRoot.Verb.CHECK, listOf("gpu")), "not in the stage")
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("runtime")))
+        assertRefused(f.verb(OneiosRoot.Verb.CHECK, listOf("gpu")), "no OneiOS runtime is staged")
+        runtimeWith(
+            f,
+            mapOf(
+                "gpuctl" to "echo \"/dev/kgsl-3d0 opens\"; echo \"args:\$*:\"; echo \"tmp:\$TMPDIR\"; echo to-stderr >&2; echo ok",
+                "bridgectl" to "echo \"args:\$*:\"; if [ \"\$1\" = bt ]; then echo 'the HAL did not become ready (state -1)'; echo failed; exit 1; fi; echo ok",
+                "camctl" to "o=; while [ \$# -gt 0 ]; do [ \"\$1\" = --out ] && o=\$2; shift; done; " +
+                    "echo 'frames: 90 read, 0 missed by the reader; first frame 400 ms after the start'; printf '\\211PNG\\r\\n\\032\\n-picture' > \"\$o\"; echo \"wrote \$o\"",
+            ),
+        )
+        val (o, run) = checkRun(f, "gpu")
+        assertOk(o)
+        assertEquals(0, run!!.exit)
+        assertEquals(listOf("/dev/kgsl-3d0 opens", "args::", "tmp:${f.stage.path}/checks", "to-stderr", "ok"), run.output)
+        assertEquals(OneiosCheckOutcome.PASS, OneiosChecks.classify(OneiosChecks.byId("gpu")!!, run).outcome)
+        // The arguments are the table's, with the stage's folders in them.
+        assertEquals("args:audio ${f.stage.path}/runtime/bin/oneios-audio:", checkRun(f, "audio").second!!.output.first())
+        assertEquals("args:haptic 200 1000:", checkRun(f, "haptic").second!!.output.first())
+        // A failing tool: its exit code and its lines.
+        val bt = checkRun(f, "bt").second!!
+        assertEquals(1, bt.exit)
+        val verdict = OneiosChecks.classify(OneiosChecks.byId("bt")!!, bt)
+        assertEquals(OneiosCheckOutcome.FAIL, verdict.outcome)
+        assertEquals("failed: the HAL did not become ready (state -1)", verdict.line)
+        // A tool the runtime does not have is reported, not an error.
+        val (d, missing) = checkRun(f, "display")
+        assertOk(d)
+        assertEquals("displayctl", missing!!.missing)
+        assertEquals(OneiosCheckOutcome.SKIPPED, OneiosChecks.classify(OneiosChecks.byId("display")!!, missing).outcome)
+        // The camera's picture comes back whole, and only a camera check has one.
+        assertRefused(f.verb(OneiosRoot.Verb.CHECKFILE, listOf("camera")), "left no picture")
+        assertEquals(OneiosCheckOutcome.PASS, OneiosChecks.classify(OneiosChecks.byId("camera")!!, checkRun(f, "camera").second!!).outcome)
+        val file = f.verb(OneiosRoot.Verb.CHECKFILE, listOf("camera"))
+        assertOk(file)
+        val png = File(f.stage, "checks/camera.png").readBytes()
+        assertEquals("file camera ${png.size} ${Hashes.sha256(png)}", file.reply.results.single())
+        val sent = java.util.Base64.getMimeDecoder().decode(file.text.lines().filter { it.startsWith("| ") }.joinToString("") { it.removePrefix("| ") })
+        assertTrue(sent.contentEquals(png))
+        // A tool that is not the file root hashed at staging is not run.
+        File(f.stage, "runtime/bin/gpuctl").appendText("echo changed\n")
+        assertRefused(f.verb(OneiosRoot.Verb.CHECK, listOf("gpu")), "is not the file that was staged")
+        // Never during a session.
+        File(f.stage, "control").mkdirs()
+        File(f.stage, "control/boot").writeText("boot-1\n")
+        File(f.stage, "control/state").writeText("running\n")
+        assertRefused(f.verb(OneiosRoot.Verb.CHECK, listOf("audio")), "an iOS session is running")
+        assertRefused(f.verb(OneiosRoot.Verb.UNCHECK, listOf("audio")), "an iOS session is running")
+    }
+
+    @Test
+    fun aHungToolIsEndedAtTheLimitAndWhatItChangedIsPutBack() = each { f ->
+        val backlight = f.file("sys/class/backlight/panel/brightness").also { it.parentFile.mkdirs(); it.writeText("97\n") }
+        val enable = f.file("sys/class/input/event9/device/enable").also { it.parentFile.mkdirs(); it.writeText("0\n") }
+        f.file("sys/class/input/event9/device/name").writeText("als_rear\n")
+        f.file("sys/class/input/event3/device").mkdirs()
+        f.file("sys/class/input/event3/device/name").writeText("gpio-keys\n")
+        val sys = f.root.path + "/sys/class"
+        runtimeWith(
+            f,
+            mapOf(
+                // Dims the panel, turns the sensor on, then hangs: one that ends on SIGTERM, one that ignores it.
+                "brightctl" to "echo 3 > $sys/backlight/panel/brightness; echo 1 > $sys/input/event9/device/enable; echo 'slider   5% -> wanted 3, the node was written 3'; " +
+                    "if [ \"\$1\" = als ]; then trap '' TERM; fi; while :; do sleep 0.2; done",
+                "bridgectl" to "echo started; while :; do sleep 0.2; done",
+                "gpuctl" to "echo ok",
+            ),
+        )
+        val t0 = System.currentTimeMillis()
+        val (o, run) = checkRun(f, "levels", limit = 1)
+        assertOk(o)
+        assertEquals(1, run!!.timeoutSeconds)
+        assertTrue("took ${System.currentTimeMillis() - t0} ms", System.currentTimeMillis() - t0 < 10_000)
+        assertEquals(listOf("slider   5% -> wanted 3, the node was written 3"), run.output)
+        assertEquals("97", backlight.readText().trim())
+        assertEquals("0", enable.readText().trim())
+        assertTrue(o.reply.infos.toString(), o.reply.infos.containsAll(listOf("put back: backlight panel 97", "put back: light sensor event9 enable 0")))
+        val verdict = OneiosChecks.classify(OneiosChecks.byId("levels")!!, run)
+        assertEquals(OneiosCheckOutcome.FAIL, verdict.outcome)
+        assertTrue(verdict.line, verdict.line.startsWith("Ended after 1 s"))
+        // A tool that ignores SIGTERM is killed 2 s later; the sensor goes back, the backlight is not this check's to write.
+        backlight.writeText("97\n")
+        val (o2, run2) = checkRun(f, "als", limit = 1)
+        assertOk(o2)
+        assertEquals(1, run2!!.timeoutSeconds)
+        assertEquals("0", enable.readText().trim())
+        assertEquals("3", backlight.readText().trim())
+        // A check with nothing to put back is ended the same way, and the next check runs.
+        assertEquals(1, checkRun(f, "haptic", limit = 1).second!!.timeoutSeconds)
+        assertEquals(0, checkRun(f, "gpu", limit = 1).second!!.exit)
+        // Without the test root's override the limit is the table's (the fake root is the only place it can be set).
+        assertTrue(rootScript.readText().contains("if [ -n \"\$T\" ] && is_dec \"\${ONEIOS_CHECK_LIMIT:-x}\"; then limit=\$ONEIOS_CHECK_LIMIT; fi"))
+    }
+
+    /** The app ends a root command that never answers, then asks for the put-back step alone. */
+    @Test
+    fun thePutBackStepRunsAgainByItself() = each { f ->
+        val backlight = f.file("sys/class/backlight/panel/brightness").also { it.parentFile.mkdirs(); it.writeText("120\n") }
+        assertRefused(f.verb(OneiosRoot.Verb.UNCHECK, listOf("levels")), "not in the stage")
+        runtimeWith(f, mapOf("brightctl" to "echo ok"))
+        assertEquals("uncheck nothing", f.verb(OneiosRoot.Verb.UNCHECK, listOf("levels")).reply.ok)
+        // As a killed check leaves it: the value read before the tool ran, the panel at the tool's last level,
+        // the display test's socket folder.
+        val checks = File(f.stage, "checks").also { it.mkdirs() }
+        File(checks, "saved.backlight").writeText("panel 120\n../../etc 5\npanel x\n")
+        File(checks, "saved.als").writeText("event9 7\n")
+        File(checks, "displayctl.Ab12Cd").mkdirs()
+        File(checks, "displayctl.Ab12Cd/display.sock").writeText("")
+        backlight.writeText("1\n")
+        val o = f.verb(OneiosRoot.Verb.UNCHECK, listOf("levels"))
+        assertOk(o)
+        assertEquals("120", backlight.readText().trim())
+        assertEquals(listOf("put back: backlight panel 120"), o.reply.infos)
+        assertFalse(File(checks, "displayctl.Ab12Cd").exists())
+        // Once: a second call has nothing saved and writes nothing.
+        backlight.writeText("44\n")
+        assertOk(f.verb(OneiosRoot.Verb.UNCHECK, listOf("levels")))
+        assertEquals("44", backlight.readText().trim())
     }
 
     private companion object {

@@ -32,6 +32,12 @@
             android:exported="false"
             android:label="@string/oneios_title"
             android:parentActivityName=".ui.SystemsActivity" />
+        <!-- Hardware checks of the iOS system: OneiOS's phone tools, run as root beside One UI. -->
+        <activity
+            android:name=".ui.OneiosChecksActivity"
+            android:exported="false"
+            android:label="@string/oneios_checks"
+            android:parentActivityName=".ui.OneiosActivity" />
         <activity android:name=".ui.EnvironmentActivity" android:exported="false" />
         <activity android:name=".ui.BootProgressActivity" android:exported="false" />
         <activity android:name=".ui.DebugSettingsActivity" android:exported="false" />

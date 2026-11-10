@@ -50,6 +50,7 @@ Choose a system → **iOS 27 (OneiOS)** → Open (`OneiosActivity`, `OneiosJob`)
   `oneios_return.sh`; with no open session it does nothing).
 - The experimental tick and **Switch to iOS 27**, enabled only with the tick and a passing preflight.
 - *Remove the iOS files*.
+- **Hardware checks**: a screen of its own (`OneiosChecksActivity`), below.
 
 Importing either package: the app reads the tar twice. First for the manifest, which it parses and checks
 (`OneiosManifests.parse`: format version, plain relative paths, sizes, SHA-256s, no duplicates; a runtime must
@@ -58,6 +59,73 @@ the app hashes it (`OneiosPackage.unpack`): a member the manifest does not list,
 missing file, a link or a device ends the import. Root checks each file's size and SHA-256 again as it writes it
 into `<kind>.new`, and only `finish` puts the new runtime or image in place of the old one. A failed import leaves
 what was staged before untouched.
+
+## Hardware checks
+
+iOS 27 (OneiOS) → **Hardware checks**: OneiOS's own phone tools, run as root **while One UI keeps running**, one row
+per check. They come in the runtime package (`bin/bridgectl`, `gpuctl`, `displayctl`, `brightctl`, `camctl`; OneiOS
+release `v0.1.0` is the first that has them all), so the screen uses the staged runtime; with none staged it shows
+*Download from OneiOS's releases* first (the latest release, the same download as on the iOS screen).
+**None of the tools has run on the phone yet**: the first Run all is their first run.
+
+| Row | Command (in `runtime/bin`) | Limit | Said before it runs |
+|---|---|---|---|
+| CPU layout | `bridgectl cpu` | 15 s | |
+| GPU | `gpuctl` (Adreno through drm2kgsl and udmabuf) | 30 s | |
+| Display layer | `displayctl test` | 30 s | colour bars over the whole screen for 5 s |
+| Haptics | `bridgectl haptic 200 1000` | 10 s | the phone buzzes once |
+| Haptics pattern | `bridgectl haptic-pattern` | 15 s | three taps, then a ramp |
+| Audio | `bridgectl audio <bin>/oneios-audio` | 20 s | a 440 Hz tone for 2 s |
+| Bluetooth | `bridgectl bt` | 45 s | Bluetooth has to be off in One UI |
+| Brightness | `brightctl info` | 10 s | |
+| Brightness steps | `brightctl levels` | 30 s | adaptive brightness has to be off; the screen steps dim to full for 12 s |
+| Light sensor | `brightctl als 10` | 25 s | cover the back, then point it at a light |
+| Cameras | `camctl --backend ndk list` | 30 s | |
+| Camera | `camctl --backend ndk --camera wide --frames 90 --out <checks>/camera.png capture` | 45 s | the camera is used briefly; close the Camera app |
+| Cameras by the HAL (experimental) | `camctl --backend hal list` | 30 s | |
+| Camera by the HAL (experimental) | `camctl -v --backend hal --camera wide --frames 90 --out <checks>/camera-hal.png capture` | 45 s | Samsung's HAL opened directly, never tried |
+
+- **Run all** (the button at the bottom) runs the twelve ordinary rows in this order, after one dialog that lists
+  what the owner will see, hear and has to do. The two HAL rows are not part of it. **Run** on a row runs that one;
+  a row with something to say asks first.
+- The app reads two settings itself: with Bluetooth on, the Bluetooth row is not run, and with adaptive brightness
+  on, Brightness steps is not run. In Run all they are marked **Skipped** with the reason; a single Run says so and
+  starts nothing.
+- A row shows **Pass**, **Fail** or **Skipped** and one line: the tool's last line, or what the tool found (the CPU
+  plan, the panel's node and range, frames and frame rate). Tapping the row opens the details: the command, the
+  full output (the tool's stdout and stderr, selectable), and for the camera rows the PNG the tool wrote. **Copy**
+  and **Share** there take that check's log; **Share all** and **Copy all** take every check's log as one text,
+  headed by the app version, the runtime version, the phone and the time. A shared text is cut at 200,000 characters.
+- **Skipped** also means: the tool is not in the staged runtime ("Not in this runtime: bin/camctl"), the owner
+  pressed Stop, or root refused (an open session).
+- **Stop** ends the running tool and leaves the rest of the queue as Skipped.
+
+How a check runs. `oneios_root.sh check <id>` (the app's usual launcher; the id is one of the table's, nothing
+else is taken): refuses during an iOS session, without a staged runtime, and when One UI is not fully up; runs only
+the file whose SHA-256 root recorded when the runtime was staged; starts it with no stdin and `TMPDIR` in
+`<stage>/checks`; prints its output and `exit <code>`, `timeout <seconds>` or `missing <tool>`. The app
+(`OneiosChecks.classify`, `core/model`) reads the verdict from the exit code **and** the tool's lines:
+`ok`/`failed` for bridgectl, `ok`/`FAILED at: ...` for gpuctl, `displayctl: ok`, `brightctl: ok` (plus a `panel:`
+line that names a device, a `restored` line), `back end: ndk, N cameras` with N above 0, and for a capture frames
+read, a written PNG and a picture that is not black. The failure lines of camctl's README
+(`status -10013`, `hal: no service`, `exception -8, camera status 2`, `configureStreams ... status 1`,
+`no frame arrived`, `(black`) each add a line that says what it means.
+
+**Time limits.** Root's: at the row's limit the tool gets SIGTERM (bridgectl, brightctl and displayctl put back
+what they changed on it), 2 s later SIGKILL, only if the pid is still that tool. The row then fails with
+"Ended after N s". The app's: 20 s after root's limit it ends the root command itself and runs `uncheck <id>`.
+
+**What is put back** after a tool was ended (by root's limit, by Stop, or by `uncheck <id>`): the tool and its
+helpers are killed (only processes whose command line is a file of `<stage>/runtime/bin`, and the display test's
+`OneiOSDisplay` layer process); the backlight is written back to the level read before `brightctl levels` ran; the
+light sensor's `enable` file gets the value it had before `brightctl` ran; the display test's socket folder is
+removed. A tool that ends by itself has done this itself (each README's "restore").
+
+**What the checks never do** (`OneiosScriptTest.theChecksLeaveOneUiAlone`, on the script's text): set a property,
+stop or start a service or zygote, run a session script, enter another namespace, mount, reboot, or write outside
+`<stage>/checks`, except those two put-back writes under `/sys/class/backlight` and `/sys/class/input`. The camera
+check's picture stays on the phone: in `<stage>/checks` and, for the details view, in the app's cache; Share sends
+text only.
 
 ## Stage
 
@@ -74,6 +142,7 @@ and neither kind of session starts while the other's stage has anything mounted.
 | `session/` | what xnuhost and the switch share in the running or last session: `xnuhost.log`, `xnuhost.pid`, `ready`, `return.request`, `display.sock`, `tmp/` |
 | `control/` | the way back's own: the session's state, the baseline, xnuhost's pid and namespace as the switch recorded them, the watcher's and key readers' pids, the return's lock and guard. Read-only in xnuhost's namespace, like the two session scripts and `bin/` |
 | `logs/` | the last five sessions' xnuhost logs |
+| `checks/` | the hardware checks' own: each check's last output (`<id>.log`), the camera pictures (`camera.png`, `camera-hal.png`), the values to put back (`saved.backlight`, `saved.als`), the tools' temporary files |
 | `switch.log`, `return.log`, `return.outcome` | the switch's and the return's own output; how the last return ended |
 
 ## Session flow
@@ -227,6 +296,15 @@ the two meet at the return's lock.
   come back, no system_server, a user that never unlocks), for a return that hangs (the guard) and for a
   return whose lock holder is gone. These are the scripts' logic, not the phone: `getevent`'s `*` mark, cgroup
   v2, the composer restart and the forced restart are still to be seen on the S24 Ultra.
+- **Hardware checks.** `core/model` `OneiosChecksTest`: the reading of each tool's output (bridgectl's five
+  commands, gpuctl, displayctl, brightctl's three, camctl's list and capture with every failure line of its
+  README), a missing tool, a tool ended at its limit, root's result lines, the shared text. `OneiosScriptTest`,
+  with shell scripts standing in for the tools in a staged runtime: the script's table is the app's (tool,
+  arguments, limit per id); a check passes the table's arguments and returns output and exit code; a missing
+  tool; a changed tool is not run; no check during a session; the camera's picture comes back intact; **a hung
+  tool is ended at the limit, also one that ignores SIGTERM, and the backlight and the sensor are put back**;
+  `uncheck` alone puts back once and takes only plain names and numbers from its saved files; the guards on the
+  script's text. Not covered by any test: the screen itself, and every tool on the phone.
 - `./gradlew :core:model:test :core:root:testDebugUnitTest`. The app itself needs the SESL9 libraries from
   GitHub Packages (a token in `~/.config/twidget/github.properties`), as before this change.
 
@@ -252,6 +330,13 @@ is set, so without it an earlier build has to be uninstalled before a new one in
 debug build too: Android guests that already hold upstream's release-signed one cannot take it as an update.
 
 ## Not done yet
+
+- **Hardware checks have not run on the phone.** Unknown until they do: whether KernelSU's `su` from the app gives
+  the tools what adb's root shell gives them (SELinux context, mount namespace); whether `displayctl`'s helper
+  starts from the stage (`app_process` with a dex under `/data/local/tmp/oneios/runtime/lib`); whether `pkill -f`
+  on this build matches as the put-back step expects; whether the app reads Bluetooth's and adaptive brightness's
+  state on One UI 8 without a permission (if not, it reads "off" and the row runs). The screen's layout was
+  compiled, not seen.
 
 - **xnuhost does not exist yet.** The switch starts whatever the runtime package names, by the contract above;
   the booter's own interface on OneiOS's board (`docs/agents.md`) replaces that command line if it differs.

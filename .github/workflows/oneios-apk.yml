@@ -159,6 +159,8 @@ jobs:
 
           The iOS system has not run on a phone yet. Its switch refuses until a OneiOS runtime with a real xnuhost and an image set are staged.
 
+          **Hardware checks** (iOS 27 (OneiOS) → Hardware checks) run OneiOS's phone tools from the staged runtime while One UI keeps running: CPU layout, GPU, display layer, haptics, audio, Bluetooth, brightness, light sensor, camera. They need OneiOS runtime 0.1.0 or newer, which the screen downloads. None of them has run on a phone yet.
+
           Built by [run $GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
           NOTES
           sed -i 's/^          //' notes.md

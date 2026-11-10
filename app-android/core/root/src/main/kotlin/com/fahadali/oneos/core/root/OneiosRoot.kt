@@ -1,5 +1,6 @@
 package com.fahadali.oneos.core.root
 
+import com.fahadali.oneos.core.model.OneiosChecks
 import com.fahadali.oneos.core.model.OneiosKind
 import com.fahadali.oneos.core.model.OneiosManifests
 import com.fahadali.oneos.core.model.OneiosSystem
@@ -34,6 +35,15 @@ object OneiosRoot {
         /** Back to One UI: runs oneios_return.sh; nothing happens without an open session. */
         RETURN("return", Stdin.NONE),
         REMOVE("remove", Stdin.SCRIPT),
+
+        /** One hardware check ([OneiosChecks]): a tool of the staged runtime, beside One UI, with a time limit. */
+        CHECK("check", Stdin.NONE),
+
+        /** The put-back step of a check alone, when its root command had to be ended. */
+        UNCHECK("uncheck", Stdin.NONE),
+
+        /** The picture a camera check wrote, in base64. */
+        CHECKFILE("checkfile", Stdin.NONE),
     }
 
     /** What the launcher's checks look at: the phone, or a fake root in the tests. */
@@ -89,6 +99,14 @@ object OneiosRoot {
                     need(5); arg(1, DEC, "a file count"); arg(2, DEC, "a format"); arg(3, WORD, "a version"); arg(4, WORD, "a build")
                 }
                 else -> p += "finish: runtime or image"
+            }
+            Verb.CHECK, Verb.UNCHECK -> {
+                need(1)
+                args.getOrNull(0)?.let { if (OneiosChecks.byId(it) == null) p += "${verb.word}: '${it.take(40)}' is not a hardware check" }
+            }
+            Verb.CHECKFILE -> {
+                need(1)
+                args.getOrNull(0)?.let { if (OneiosChecks.byId(it)?.picture != true) p += "checkfile: '${it.take(40)}' has no picture" }
             }
             Verb.SWITCH -> {
                 need(2); arg(0, DEC, "a versionCode")
