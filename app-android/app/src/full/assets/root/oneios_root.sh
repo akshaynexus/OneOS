@@ -424,7 +424,7 @@ check_cmd() { # <id>: TOOL (a file of the runtime's bin/), ARGS, LIMIT in second
     esac
 }
 # Is <pid> still the tool this check started (not another process that got its number)?
-check_is_tool() { grep -q -F "$STAGE/runtime/bin/$TOOL" "/proc/$1/cmdline" 2>/dev/null; }
+check_is_tool() { cat "/proc/$1/cmdline" 2>/dev/null | grep -q -F "$STAGE/runtime/bin/$TOOL"; }
 # What a check may change, read before its tool runs.
 check_save() { # <id>
     true > "$CHECKS/saved.backlight"

@@ -126,8 +126,8 @@ oneos_boot_begin() {
         oneos_boot_write hint 'Hold Volume Up + Volume Down for 3 s to go back to One UI'
     elif [ "$1" = enter ] || [ "$1" = restart ]; then
         if [ "$1" = enter ]; then
-            : > "$ONEOS_BOOT_DIR/events.log"
-            : > "$ONEOS_BOOT_DIR/renderer.log"
+            true > "$ONEOS_BOOT_DIR/events.log"
+            true > "$ONEOS_BOOT_DIR/renderer.log"
         fi
         restart_verbose=${ONEOS_VERBOSE_BOOT:-$(cat "$ONEOS_BOOT_DIR/verbose" 2>/dev/null)}
         case "$restart_verbose" in 1) ;; *) restart_verbose=0 ;; esac

@@ -1489,14 +1489,13 @@ class OneiosScriptTest {
      */
     @Test
     fun noScriptRedirectsTheColonBuiltin() = each { f ->
-        val colon = Regex("""(^|[;&|(]|\bthen|\bdo|\belse)\s*:\s+[^#]*>""")
-        for (s in listOf(switchScript, returnScript, rootScript)) {
+        // (":>file" and ": 2>/dev/null >file" too.)
+        val colon = Regex("""(^|[;&|({]|\bthen|\bdo|\belse)\s*:(\s[^#]*)?[<>]""")
+        // boot_status.sh whole: the switch runs it, and OneOS's own guests share it.
+        for (s in listOf(switchScript, returnScript, rootScript, File(Shipped.switcherAssets, "boot_status.sh"))) {
             val bad = code(s).filter { colon.containsMatchIn(it) }
             assertTrue("${s.name} redirects ':': $bad", bad.isEmpty())
         }
-        val boot = File(Shipped.switcherAssets, "boot_status.sh").readText()
-        val ios = boot.substring(boot.indexOf("if [ \"\$1\" = ios ]; then"), boot.indexOf("elif [ \"\$1\" = enter ]"))
-        assertFalse(ios, colon.containsMatchIn(ios))
         // The check itself, as the inner shell has it, with a folder that cannot be written.
         val probe = "if true 2>/dev/null > /data/control/.w; then"
         assertTrue(code(switchScript).any { it.trim() == probe })
