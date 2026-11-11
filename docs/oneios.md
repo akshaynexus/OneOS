@@ -326,7 +326,9 @@ runtime with xnuhost is staged, this is where every switch ends.**
 
 A failed check anywhere is the failsafe: `sys.powerctl reboot,oneios-inplace-failsafe`, then Android's own
 `reboot`, then busybox's `reboot -f`, then sysrq. Busybox needs no reboot applet: KernelSU's has none, and from
-0.4.77 the switch no longer asks for one (`oneos_switch.sh` never did). `oneios_return.sh reboot` goes straight there. A return with no open session does
+0.4.77 the switch no longer asks for one (`oneos_switch.sh` never did). In the session's mount namespace the stage is bound over `/data`, which hides the root manager's busybox
+(`/data/adb`): from 0.4.79 the namespace's setup runs a copy in `control/busybox` (as `guest_prepare.sh` copies
+busybox into an Android guest's `/data`). `oneios_return.sh reboot` goes straight there. A return with no open session does
 nothing, and a switch that ended before it stopped One UI's zygote (the stop is marked in `control/stopped`)
 only has its helpers ended: neither restarts anything.
 

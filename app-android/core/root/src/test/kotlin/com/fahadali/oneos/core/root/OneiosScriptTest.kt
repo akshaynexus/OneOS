@@ -1498,6 +1498,24 @@ class OneiosScriptTest {
         assertTrue(text.contains(">>\"\$STAGE/switch.log\"") && text.contains(">>\"\$STAGE/return.log\""))
     }
 
+    /**
+     * The session's namespace binds the stage over /data, which hides the root manager's busybox (/data/adb): every
+     * busybox call after the bind is the copy in the control folder (phone run of 0.4.77: "busybox: inaccessible or
+     * not found", then "could not make /data/runtime read-only").
+     */
+    @Test
+    fun theSessionsNamespaceRunsBusyboxFromTheStageAfterTheBind() {
+        val sw = switchScript.readText()
+        val inner = sw.substringAfter("    --inner)\n").substringBefore("\n        ;;\n")
+        val bind = inner.indexOf("\"\$BB\" mount --bind \"\$STAGE\" /data")
+        val copy = inner.indexOf("cp \"\$BB\" \"\$CTL/busybox\"")
+        val switchTo = inner.indexOf("BB=/data/control/busybox")
+        assertTrue("bind $bind, copy $copy, switch $switchTo", bind > 0 && copy in 0 until bind && switchTo > bind)
+        // The bind's own line runs the host's busybox (still visible then); nothing between it and the switch may.
+        val between = inner.substring(inner.indexOf('\n', bind) + 1, switchTo)
+        assertFalse("busybox from /data/adb after the bind: $between", between.contains("\"\$BB\""))
+    }
+
     /** What the return and the watcher write to return.log is what the summary's "Return:" reads. */
     @Test
     fun theReturnsLogSaysWhoReturnedAndHow() = each { f ->

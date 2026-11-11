@@ -275,8 +275,15 @@ case "$MODE" in
         R_XNUHOST=$(conf "$STAGE/runtime.conf" xnuhost)
         [ -n "$BB" ] && [ -x "$BB" ] || die_inner "no busybox"
         [ "$(readlink /proc/$$/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ] || die_inner "still in init's mount namespace"
+        # The root manager's busybox is in One UI's /data (/data/adb), which the bind below hides: the rest of
+        # this namespace's setup runs a copy in the way back's control folder (root's, read-only in here), as
+        # OneOS's guest_prepare.sh copies busybox into the guest's /data. It keeps the name busybox (a
+        # multi-call busybox goes by its name).
+        cp "$BB" "$CTL/busybox" && chmod 0700 "$CTL/busybox" || die_inner "could not copy $BB to $CTL/busybox"
         "$BB" mount --make-rprivate / || die_inner "could not make the mounts private"
         "$BB" mount --bind "$STAGE" /data || die_inner "could not bind the stage over /data"
+        BB=/data/control/busybox
+        "$BB" true 2>/dev/null || die_inner "busybox does not run from the stage ($BB)"
         # Read-only in here: the runtime and the image (as staged), and what
         # the way back runs and reads (its scripts, its control folder).
         for d in runtime image control bin oneios_switch.sh oneios_return.sh; do
