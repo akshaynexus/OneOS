@@ -165,6 +165,13 @@ val oneiosScripts: Map<String, File> = linkedMapOf(
     "oneios_switch.sh" to File(repoRoot, "switcher/assets/oneios_switch.sh"),
     "oneios_return.sh" to File(repoRoot, "switcher/assets/oneios_return.sh"),
 )
+// OneOS's boot screen for the iOS switch (docs/oneios.md, "Boot screen"): the same three files the Android
+// guests' stage gets (sessionScripts above), also shipped as assets/oneios/<name> and pinned in BuildConfig.
+val oneiosBootScreen: Map<String, File> = linkedMapOf(
+    "boot_status.sh" to sessionScripts.getValue("boot_status.sh"),
+    "OneOSBootStatus.dex" to sessionScripts.getValue("OneOSBootStatus.dex"),
+    "oneos_boot_icon.png" to sessionScripts.getValue("oneos_boot_icon.png"),
+)
 val oneiosRootScript: File = file("src/full/assets/root/oneios_root.sh")
 
 /** `<sha256>  <name>` lines (`#` comments skipped), as sha256sum writes them. */
@@ -385,7 +392,7 @@ val oneosFiles = tasks.register<OneOsFilesTask>("oneosFiles") {
     sets.set(packageSets.filterKeys { it in packedSets }.mapValues { (_, v) -> "${v.first.path}|${v.second.joinToString(",")}" })
     scripts.set(sessionScripts.mapValues { it.value.path })
     notShipped.set(switcherNotShipped)
-    oneios.set(oneiosScripts.mapValues { it.value.path })
+    oneios.set((oneiosScripts + oneiosBootScreen).mapValues { it.value.path })
     packSets.set(packSetsInApk)
     remoteIds.set(setRemoteIds)
     packages.set(packagesDir)
@@ -492,7 +499,7 @@ android {
         // Pixel, HyperOS and Nothing OS (it stayed at 24 Hz: 10-15 fps). Infinity-X: Samsung IMS (the carve-out's
         // /system/system_ext path; framework members; SMS centre). The Galaxy A16 4G (SM-A165F).
         versionCode = 100
-        versionName = "0.4.79"
+        versionName = "0.4.80"
         // 0.4.56 (73), TEST CHANNEL ONLY: the Find N6 set's Theme Store logs every OkHttp request and reply (n6g_r7,
         // patches/theme_store_netlog.py) for the owner's "No Data" log; the next public build goes back to n6g_r6.
         // Send to the OneOS team (0.4.29, both editions): the report service's
@@ -528,6 +535,8 @@ android {
             buildConfigField("long", "ONEIOS_ROOT_BYTES", "${oneiosRootBytes.size}L")
             buildConfigField("String", "ONEIOS_SWITCH_SHA256", "\"${sha256(oneiosScripts.getValue("oneios_switch.sh"))}\"")
             buildConfigField("String", "ONEIOS_RETURN_SHA256", "\"${sha256(oneiosScripts.getValue("oneios_return.sh"))}\"")
+            // "<name>=<sha256>" of each boot screen file, in OneiosRoot.BOOT_SCREEN_FILES' order.
+            buildConfigField("String", "ONEIOS_BOOT_SCREEN_SHA256", "\"${oneiosBootScreen.entries.joinToString(",") { "${it.key}=${sha256(it.value)}" }}\"")
             if (seriesId != null) versionNameSuffix = "-$seriesId"
             for ((id, _) in packageSets) {
                 val f = File(packagesDir, "$id.sha256")

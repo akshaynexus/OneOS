@@ -94,6 +94,8 @@ step() {
     say "=== $* ==="
 }
 do_reboot() { # <reason word>
+    # Nothing of the session's on the screen while the phone restarts.
+    bootui_end
     sync
     setprop sys.powerctl "reboot,$1"
     sleep 20
@@ -144,6 +146,52 @@ end_readers() {
         kill -9 -- "-$p" 2>/dev/null
         kill -9 "$p" 2>/dev/null
     done
+}
+# The boot screen of the switch (oneios_switch.sh: OneOS's boot_status.sh and
+# its renderer, with the switch's feeder), where it is still up: iOS never
+# drew, or ended before it did. Its status files are in control/bootui.
+BOOTUI=$CTL/bootui
+bootui() { # <a function of boot_status.sh> [arguments]; never fails
+    [ -d "$BOOTUI" ] && [ -f "$S/bin/boot_status.sh" ] || return 0
+    ( ONEOS_BOOT_DIR=$BOOTUI; ONEOS_BOOT_HOME=$S/bin; . "$S/bin/boot_status.sh" && "$@" ) >/dev/null 2>&1
+    return 0
+}
+# Ends it, on every return: the stop flag and a new generation retire the
+# supervisor, the renderer (which takes its layer away) and the feeder; they
+# get a second, then SIGKILL, each by its pid and only while that pid is
+# still what it was. One UI-side processes in init's namespace and the root
+# cgroup: none of them is the session's for Gate A, and a renderer that could
+# not be ended is logged only, because the composer restart of Gate B drops
+# every layer it had. Nothing of the return waits for it longer than 2 s.
+bootui_end() {
+    [ -d "$BOOTUI" ] && [ ! -e "$BOOTUI/ended" ] || return 0
+    : 2>/dev/null > "$BOOTUI/stop"
+    echo "ended.$$" 2>/dev/null > "$BOOTUI/generation"
+    bn=0
+    while [ $bn -lt 10 ]; do
+        bleft=""
+        for bp in $(cat "$BOOTUI/feeder.pid" 2>/dev/null); do
+            is_ours "$bp" "oneios_switch.sh --bootui" || continue
+            kill -9 "$bp" 2>/dev/null
+            [ ! -d "$P/$bp" ] || bleft="$bleft$bp "
+        done
+        for bp in $(cat "$BOOTUI/supervisor" 2>/dev/null); do
+            is_ours "$bp" "boot_status.sh supervise" || continue
+            [ $bn -lt 5 ] || kill -9 "$bp" 2>/dev/null
+            [ ! -d "$P/$bp" ] || bleft="$bleft$bp "
+        done
+        for bp in $({ cat "$BOOTUI/worker"; cut -d' ' -f1 "$BOOTUI/ready"; } 2>/dev/null | sort -u); do
+            is_ours "$bp" OneOSBootStatus || continue
+            [ $bn -lt 5 ] || kill -9 "$bp" 2>/dev/null
+            [ ! -d "$P/$bp" ] || bleft="$bleft$bp "
+        done
+        [ -n "$bleft" ] || break
+        sleep 0.2; bn=$((bn + 1))
+    done
+    : 2>/dev/null > "$BOOTUI/ended"
+    if [ -n "$bleft" ]; then say "boot screen: still running after SIGKILL ($bleft): logged only, its layer goes with the composer restart"
+    else say "boot screen: ended"; fi
+    return 0
 }
 wait_found() { # <servicemanager name> <seconds>
     w=0
@@ -232,6 +280,10 @@ finished() { # the guard's mark and the lock go; the wakelocks are released
 }
 
 step "[1/5] Stopping the session"
+# The boot screen, while it is still up, says what happens now. The watcher
+# wrote its reason there already.
+bootui oneos_boot_write title 'Returning to One UI'
+[ "$WHO" = watcher ] || bootui oneos_boot_write status 'Stopping iOS'
 # The key readers and the watcher (unless this return is the watcher's own
 # child, or the watcher itself).
 : > "$CTL/keys/session" 2>/dev/null
@@ -314,6 +366,8 @@ end_display() {
     return 0
 }
 end_display
+# The boot screen ends here, before the first gate and on every path below.
+bootui_end
 
 # One UI's panel brightness from the switch's baseline: xnuhost is gone by here,
 # so nothing writes the node any more. Only a backlight node, only a number;

@@ -32,6 +32,9 @@ class OneiosScriptTest {
     private val switchScript = File(Shipped.switcherAssets, "oneios_switch.sh")
     private val returnScript = File(Shipped.switcherAssets, "oneios_return.sh")
 
+    /** OneOS's boot screen, which the iOS switch shows too: staged in the iOS stage's bin/. */
+    private val bootScreenFiles = OneiosRoot.BOOT_SCREEN_FILES.map { File(Shipped.switcherAssets, it) }
+
     private val shells: List<String> =
         // busybox is not a shell by its own name ("busybox sh"): the others are run as <shell> -c.
         (listOf("/bin/sh") + TestShell.available().filterNot { it.appletsFirst }.map { it.path }).filter { File(it).canExecute() }.distinct()
@@ -110,7 +113,7 @@ class OneiosScriptTest {
             verb(OneiosRoot.Verb.RECEIVE, listOf(kind, path, bytes.size.toString(), sha, mode), bytes)
 
         fun scripts() {
-            for (f in listOf(switchScript, returnScript)) {
+            for (f in listOf(switchScript, returnScript) + bootScreenFiles) {
                 val b = f.readBytes()
                 assertOk(verb(OneiosRoot.Verb.SCRIPT, listOf(f.name, b.size.toString(), Hashes.sha256(b)), b))
             }
@@ -1108,6 +1111,373 @@ class OneiosScriptTest {
         assertTrue(ret.contains("\"\$BB\" reboot -f") && ret.contains("echo b > \"\$P/sysrq-trigger\""))
         // Nothing is unmounted by the return, in any namespace.
         assertFalse(ret.contains("umount"))
+    }
+
+    // --- The boot screen: OneOS's, from the stop of One UI's framework until iOS draws ----
+
+    /**
+     * The boot screen's status folder as the switch leaves it (`boot_status.sh`'s `oneos_boot_begin ios`), in the way
+     * back's control folder. With [processes]: its supervisor, its renderer and the switch's feeder, as fake processes.
+     */
+    private fun bootScreen(f: Fake, processes: Boolean = false, drawn: Boolean = true): File {
+        val d = File(f.control, "bootui").apply { mkdirs() }
+        File(d, "generation").writeText("g1\n")
+        File(d, "title").writeText("Starting iOS 27\n")
+        File(d, "status").writeText("Stopping One UI's framework\n")
+        if (drawn) File(d, "ready").writeText("7002 g1\n")
+        if (processes) {
+            f.proc(7001, "sh", cmdline = "/system/bin/sh ${f.stage}/bin/boot_status.sh supervise g1 ios")
+            f.proc(7002, "app_process", cmdline = "app_process /system/bin OneOSBootStatus $d g1 1800")
+            f.proc(7003, "sh", cmdline = "/system/bin/sh ${f.stage}/oneios_switch.sh --bootui")
+            File(d, "supervisor").writeText("7001\n")
+            File(d, "worker").writeText("7002\n")
+            File(d, "feeder.pid").writeText("7003\n")
+        }
+        return d
+    }
+
+    private fun shown(d: File, name: String = "status") = File(d, name).takeIf { it.isFile }?.readText()?.trim().orEmpty()
+
+    /** The switch's feeder: reads xnuhost's log and writes the boot screen's status line. */
+    private fun feeder(f: Fake, d: File): Process {
+        val p = f.start("oneios_switch.sh", "--bootui", log = "log/bootui")
+        await("the feeder's pid") { File(d, "feeder.pid").isFile }
+        return p
+    }
+
+    private fun xnuhostSays(f: Fake, vararg lines: String) = File(f.session, "xnuhost.log").appendText(lines.joinToString("") { "$it\n" })
+
+    private fun assertBootScreenEnded(f: Fake, d: File, text: String) {
+        for (pid in 7001..7003) assertFalse("$pid is left\n$text", f.file("proc/$pid").exists())
+        assertTrue(text, File(d, "stop").exists() && shown(d, "generation").startsWith("ended."))
+        assertTrue(text, f.kills.containsAll(listOf("-9 7001", "-9 7002", "-9 7003")))
+        assertTrue(text, f.returnLog.contains("boot screen: ended"))
+    }
+
+    /** Root stages the three files in bin/, which xnuhost's namespace has read-only; the verb takes no other name. */
+    @Test
+    fun theBootScreenFilesAreStagedWhereTheGuestCannotWrite() = each { f ->
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("image")))
+        f.scripts()
+        for (a in bootScreenFiles) assertTrue(a.name, File(f.stage, "bin/${a.name}").readBytes().contentEquals(a.readBytes()))
+        assertEquals(listOf("boot_status.sh", "OneOSBootStatus.dex", "oneos_boot_icon.png"), OneiosRoot.BOOT_SCREEN_FILES)
+        val sum = "a".repeat(64)
+        for (n in OneiosRoot.SESSION_FILES) assertEquals(n, emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.SCRIPT, listOf(n, "10", sum)))
+        for (n in listOf("guest_start.sh", "bin/boot_status.sh", "oneios_root.sh")) {
+            assertTrue(n, OneiosRoot.problems(OneiosRoot.Verb.SCRIPT, listOf(n, "10", sum)).isNotEmpty())
+        }
+        val inner = code(switchScript).joinToString("\n").let { it.substring(it.indexOf("    --inner)"), it.indexOf("    --stop-loop)")) }
+        assertTrue(inner.contains("for d in runtime image control bin oneios_switch.sh oneios_return.sh; do"))
+        // A changed file is not taken, and what was staged stays.
+        val icon = bootScreenFiles.last().readBytes()
+        assertRefused(f.verb(OneiosRoot.Verb.SCRIPT, listOf("oneos_boot_icon.png", icon.size.toString(), sum), icon), "did not arrive intact")
+        assertTrue(File(f.stage, "bin/oneos_boot_icon.png").readBytes().contentEquals(icon))
+    }
+
+    /** OneOS's own script makes the iOS screen: a plain title, the status line always on, the way back as a hint. */
+    @Test
+    fun oneOssBootScriptStartsTheIosScreen() = each { f ->
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("image")))
+        f.scripts()
+        val bin = File(f.stage, "bin")
+        val d = File(f.root, "bootui")
+        fun sh(script: String, vararg args: String, path: File? = null): Process {
+            val pb = ProcessBuilder(listOf(f.sh, "-c", script, "sh") + args).redirectErrorStream(true)
+            pb.environment()["ONEOS_BOOT_DIR"] = d.path
+            pb.environment()["ONEOS_BOOT_HOME"] = bin.path
+            pb.environment()["ONEOS_BOOT_MAX"] = "77"
+            path?.let { pb.environment()["PATH"] = "${it.path}:${System.getenv("PATH")}" }
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(File(f.root, "boot.out")))
+            return pb.redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))).start().also { started += it }
+        }
+        // (Its supervisor is started with /system/bin/sh, which this machine has not: only the files are made.)
+        assertTrue(sh(". \"\$1\"; oneos_boot_begin ios; oneos_boot_event 'a status line'", File(bin, "boot_status.sh").path).waitFor(30, TimeUnit.SECONDS))
+        assertEquals("Starting iOS 27", shown(d, "title"))
+        assertEquals("Hold Volume Up + Volume Down for 3 s to go back to One UI", shown(d, "hint"))
+        assertEquals("1", shown(d, "verbose"))
+        assertEquals("a status line", shown(d))
+        assertTrue(File(d, "icon.png").readBytes().contentEquals(bootScreenFiles.last().readBytes()))
+        val generation = shown(d, "generation")
+        assertTrue(generation.isNotEmpty() && !File(d, "stop").exists())
+        // No Apple name or mark on it: the title is text, the picture is OneOS's own icon.
+        val script = File(bin, "boot_status.sh").readText()
+        val ios = script.substring(script.indexOf("if [ \"\$1\" = ios ]; then"), script.indexOf("elif [ \"\$1\" = enter ]"))
+        assertFalse(ios, ios.contains("Apple", ignoreCase = true))
+        // The supervisor in its iOS mode: no Android boot events are read, the renderer gets the bound, the pids
+        // are left for the return, and the stop flag ends it.
+        val tools = File(f.root, "boottools").apply { mkdirs() }
+        fun tool(name: String, body: String) = File(tools, name).apply { writeText("#!/bin/sh\n$body\n"); setExecutable(true) }
+        tool("app_process", "echo \"\$CLASSPATH \$*\" >> \"\$ONEOS_BOOT_DIR/renderer.args\"\nwhile [ ! -f \"\$ONEOS_BOOT_DIR/stop\" ]; do sleep 0.05; done")
+        tool("logcat", "echo logcat >> \"\$ONEOS_BOOT_DIR/called\"")
+        tool("getprop", "echo getprop >> \"\$ONEOS_BOOT_DIR/called\"; echo 1")
+        tool("pidof", "echo 12345")
+        val sup = sh("exec \"\$0\" \"\$1\" supervise \"\$2\" ios".replace("\"\$0\"", f.sh), File(bin, "boot_status.sh").path, generation, path = tools)
+        await("the renderer's start") { File(d, "renderer.args").isFile && File(d, "worker").isFile }
+        assertEquals("${bin.path}/OneOSBootStatus.dex /system/bin OneOSBootStatus ${d.path} $generation 77", File(d, "renderer.args").readLines().first())
+        assertTrue(shown(d, "supervisor").toIntOrNull() != null && shown(d, "worker").toIntOrNull() != null)
+        Thread.sleep(700)
+        assertTrue(sup.isAlive)
+        File(d, "stop").createNewFile()
+        assertTrue(sup.waitFor(30, TimeUnit.SECONDS))
+        assertFalse("it read Android's boot events", File(d, "called").exists())
+        assertEquals(1, File(d, "renderer.args").readLines().size)
+    }
+
+    /** The stage line follows xnuhost's log (the Session logs screen's markers), then says why iOS stopped. */
+    @Test
+    fun theBootScreenShowsHowFarTheBootGotAndWhyItStopped() = each { f ->
+        f.phone(scale = 20)
+        val d = bootScreen(f)
+        File(f.session, "xnuhost.log").writeText("oneios inner: cgroup /sys/fs/cgroup/oneios_session\n")
+        val p = feeder(f, d)
+        Thread.sleep(300)
+        assertEquals("Stopping One UI's framework", shown(d))
+        val boot = listOf(
+            "[286239.524] xnuhost I xnuhost: session ABI 1, mode takeover, pid 4146179" to "xnuhost is loading the kernel",
+            "[286239.909] xnuhost I cpu0: entering the kernel at 0x2003dcc488" to "Entering the kernel",
+            "[286240.068] guest     Darwin Kernel Version 25.5.0: Wed Nov 11 04:04:41 IST 2026; akshay:ios-obj/DEVELOPMENT_ARM64_BCM2837" to "Kernel started",
+            "[286727.194] guest     BSD root: disk8s1, major 1, minor 12" to "Root volume mounted",
+            "[286727.411] guest     OneiOS Data: first start: /sbin/newfs_apfs -e -x -v Data /dev/disk9" to "Data volume: first start (this can take a few minutes)",
+            "[286728.026] guest     load_init_program: attempting to load /sbin/launchd" to "Loading launchd",
+            "[287612.623] guest     com.apple.xpc.launchd|2026-11-10 15:05:22.422484 <Notice>: hello, launchd UUID: CA54230D" to "launchd is running",
+            "[286981.700] guest     oneios-display: framebuffer opened by backboardd[53], type 0: status 0, client IOMobileFramebufferUserClient" to "backboardd started",
+            "[288194.264] guest     SpringBoard[124] triggered unnest of range 0x1e9c00000->0x1ebe00000 of DYLD shared region" to "SpringBoard started",
+        )
+        for ((line, text) in boot) {
+            // (Among the console's other lines, and after a megabyte of them for one stage: nothing is skipped.)
+            if (text == "Root volume mounted") File(f.session, "xnuhost.log").appendText("[286241.714] guest     pmap_startup() init/release time: 1542521 microsec\n".repeat(20_000))
+            xnuhostSays(f, "[286241.714] guest     pmap_startup() init/release time: 1542521 microsec", line)
+            await(text) { shown(d) == text }
+        }
+        // A line of an earlier stage does not take the boot back; a restart of the guest in place does.
+        xnuhostSays(f, "[288195.000] guest     BSD root: disk8s1, major 1, minor 12")
+        Thread.sleep(300)
+        assertEquals("SpringBoard started", shown(d))
+        xnuhostSays(f, "[288300.000] xnuhost I the guest asked for a restart: starting again", "[288300.100] xnuhost I xnuhost: session ABI 1, mode takeover, pid 4146179")
+        await("the restart") { shown(d) == "xnuhost is loading the kernel" }
+        // A panic, as the console has it. What is drawn is printable ASCII, whatever the guest wrote.
+        xnuhostSays(f, "[287167.735] guest     panic(cpu 1 caller 0xfffffff00ad8d2c4): Console I/O \u001b[31mfrom\u0007 interrupt-disabled context @serial_console.c:175", "[287167.737] guest       frame 0xfffffff00b4aa0cc")
+        val panic = "Console I/O  [31mfrom  interrupt-disabled context @serial_console.c:175"
+        await("the panic") { shown(d) == "Kernel panic: $panic" }
+        xnuhostSays(f, "[287167.934] xnuhost I stopping: the guest halted on cpu1 (reason 2, code 0)", "[287168.353] xnuhost I exit 4")
+        f.ends(XNUHOST)
+        await("why it ended") { shown(d) == "iOS stopped: kernel panic: $panic" }
+        // It stays up with the reason until a return begins, and then leaves the screen to the return.
+        Thread.sleep(300)
+        assertTrue(p.isAlive)
+        assertFalse(File(d, "stop").exists())
+        File(f.control, "state").writeText("returning\n")
+        assertTrue(p.waitFor(30, TimeUnit.SECONDS))
+        assertFalse(File(d, "stop").exists())
+        // It only read and wrote its own folder: nothing was signalled, nothing asked of init, no return asked.
+        assertEquals(emptyList<String>(), f.kills)
+        assertEquals(emptyList<String>(), f.setprops)
+        assertFalse(File(f.session, "return.request").exists())
+        assertEquals("Starting iOS 27", shown(d, "title"))
+    }
+
+    /** The screen goes when the guest's picture is on the display helper's layer, and stays while iOS shows nothing. */
+    @Test
+    fun theBootScreenIsHandedToTheDisplayHelperAtTheGuestsFirstFrame() = each { f ->
+        f.phone(scale = 20)
+        val d = bootScreen(f)
+        val p = feeder(f, d)
+        // xnuhost reports ready, and no display helper runs: nothing shows iOS, so the screen stays.
+        xnuhostSays(f, "[1.000] xnuhost I xnuhost: session ABI 1, mode takeover, pid 1", "[288301.000] xnuhost I guest ready: first frame")
+        await("ready") { shown(d) == "iOS is up: waiting for its first frame" }
+        // A helper's log of another session, and a pid that is some other process now: still nothing.
+        File(f.control, "display.log").writeText("oneios-display: layer up\noneios-display: first frame posted (1440x3120 buffer, stride 5760, format 1)\n")
+        File(f.control, "display.pid").writeText("300\n")
+        Thread.sleep(400)
+        assertTrue(p.isAlive && !File(d, "stop").exists())
+        // The helper, connected and with its layer up, but no frame yet and no ready: the screen stays.
+        f.proc(7100, "app_process", cmdline = "app_process /system/bin OneiOSDisplay --session ${f.session} --takeover --wait 60")
+        File(f.control, "display.pid").writeText("7100\n")
+        File(f.control, "display.log").writeText("oneios-display: guest frame 1440x3120, stride 5760\noneios-display: layer up\n")
+        Thread.sleep(400)
+        assertTrue(p.isAlive && !File(d, "stop").exists())
+        assertFalse(File(d, "native").exists())
+        // The helper put the display's projection on the panel's own mode: the renderer is told to draw for it.
+        File(f.control, "display.log").appendText("oneios-display: display projection set to the active mode 1440x3120\n")
+        await("the size of the panel's mode") { shown(d, "native") == "1" }
+        assertTrue(p.isAlive && !File(d, "stop").exists())
+        // Its first frame: the picture covers the boot screen, which is stopped under it.
+        File(f.control, "display.log").appendText("oneios-display: first frame posted (1440x3120 buffer, stride 5760, format 1)\n")
+        assertTrue(p.waitFor(30, TimeUnit.SECONDS))
+        assertTrue(File(d, "stop").exists())
+        assertTrue(f.lines("log/bootui").any { it.contains("the guest's picture is on the display helper's layer") })
+        assertEquals(emptyList<String>(), f.kills)
+        assertEquals("running", f.state)
+    }
+
+    /** `session/ready` hands over too, once the helper has a layer; a renderer that never drew is given up after 30 s. */
+    @Test
+    fun readyHandsTheBootScreenOverAndADeadRendererIsGivenUp() = each { f ->
+        f.phone(scale = 20)
+        val d = bootScreen(f)
+        f.proc(7100, "oneios-display", cmdline = "${f.stage}/runtime/bin/oneios-display --session ${f.session} --takeover --wait 60")
+        File(f.control, "display.pid").writeText("7100\n")
+        File(f.control, "display.log").writeText("oneios-display: layer up\n")
+        val p = feeder(f, d)
+        Thread.sleep(300)
+        assertTrue(p.isAlive && !File(d, "stop").exists())
+        File(f.session, "ready").createNewFile()
+        assertTrue(p.waitFor(30, TimeUnit.SECONDS))
+        assertTrue(File(d, "stop").exists())
+        // The other end: no frame of the renderer's own within 30 s.
+        File(d, "stop").delete()
+        File(f.control, "display.pid").delete()
+        File(d, "ready").delete()
+        val q = feeder(f, d)
+        assertTrue(q.waitFor(60, TimeUnit.SECONDS))
+        assertTrue(File(d, "stop").exists())
+        assertTrue(f.lines("log/bootui").any { it.contains("the renderer posted no frame in 30 s") })
+        assertEquals("running", f.state)
+        assertEquals(emptyList<String>(), f.setprops)
+    }
+
+    /** In place: the screen says the return began, and is gone, processes and all, before the first gate. */
+    @Test
+    fun theReturnEndsTheBootScreenBeforeItsGates() = each { f ->
+        f.phone()
+        val d = bootScreen(f, processes = true)
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        assertBootScreenEnded(f, d, r.text)
+        assertEquals("Returning to One UI", shown(d, "title"))
+        assertEquals("Stopping iOS", shown(d))
+        assertTrue(r.text, r.text.indexOf("boot screen: ended") in r.text.indexOf("SIGTERM to xnuhost") until r.text.indexOf("Gate A"))
+        assertTrue(f.kills.toString(), f.kills.indexOf("-TERM $XNUHOST") < f.kills.indexOf("-9 7003"))
+        // The feeder at once; the supervisor and the renderer get a second to take the layer away themselves.
+        assertEquals(f.kills.toString(), 1, f.kills.count { it == "-9 7002" })
+    }
+
+    /** A renderer that cannot be ended, or a pid file that names another process by now, never fails a gate. */
+    @Test
+    fun aBootScreenThatCannotBeEndedIsLoggedAndIsNoReboot() = each { f ->
+        f.phone()
+        val d = bootScreen(f, processes = true)
+        File(f.file("proc/7002"), "unkillable").createNewFile()
+        File(d, "supervisor").writeText("300\n")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        assertTrue(r.text, r.text.contains("boot screen: still running after SIGKILL (7002 ): logged only"))
+        // vold has pid 300: a pid alone is never signalled.
+        assertFalse(f.kills.toString(), f.kills.any { it.endsWith(" 300") || it.endsWith(" 7001") })
+        assertTrue(f.file("proc/300").isDirectory)
+    }
+
+    /** The failsafe reboot, the reboot return and a switch that never stopped One UI end the screen as well. */
+    @Test
+    fun aFailsafeEndsTheBootScreenToo() = each { f ->
+        f.phone()
+        val d = bootScreen(f, processes = true)
+        File(f.guest(5001, "xnuhost-tasks"), "unkillable").createNewFile()
+        val r = f.returns()
+        assertEquals(r.text, 1, r.exit)
+        f.assertFailsafe("processes still in the session's namespace or cgroup: 5001")
+        assertBootScreenEnded(f, d, r.text)
+        assertTrue(f.returnLog, f.returnLog.indexOf("boot screen: ended") < f.returnLog.indexOf("FAILSAFE: "))
+    }
+
+    @Test
+    fun theRebootReturnEndsTheBootScreenToo() = each { f ->
+        f.phone()
+        val d = bootScreen(f, processes = true)
+        val r = f.returns("reboot")
+        assertEquals(r.text, 1, r.exit)
+        assertEquals("reboot,oneios-return", f.rebooted)
+        assertBootScreenEnded(f, d, r.text)
+        assertEquals(f.kills.toString(), 3, f.kills.size)
+    }
+
+    @Test
+    fun aSwitchThatNeverStoppedOneUiHasItsBootScreenEnded() = each { f ->
+        f.phone(stopped = false, state = "starting")
+        val d = bootScreen(f, processes = true)
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(r.text, r.text.contains("The switch ended before One UI's framework was stopped: nothing to restore."))
+        assertBootScreenEnded(f, d, r.text)
+        assertEquals(emptyList<String>(), f.setprops)
+    }
+
+    /** The watcher's return: the screen says why iOS stopped until the return ends it. */
+    @Test
+    fun theWatchersReturnSaysWhyOnTheBootScreenAndEndsIt() = each { f ->
+        f.phone()
+        val d = bootScreen(f, processes = true)
+        File(f.session, "xnuhost.log").writeText(
+            "[1.000] xnuhost I xnuhost: session ABI 1, mode takeover, pid 1\n[1.100] xnuhost E image: /data/image/os.img is not an image of format 1\n",
+        )
+        val w = watcher(f)
+        f.ends(XNUHOST)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        assertEquals(f.returnLog, 0, w.exitValue())
+        assertTrue(f.returnLog, f.returnLog.contains("watcher: xnuhost $XNUHOST ended (last log lines: "))
+        f.assertInPlace()
+        assertBootScreenEnded(f, d, f.returnLog)
+        assertEquals("Returning to One UI", shown(d, "title"))
+        assertEquals("xnuhost ended: image: /data/image/os.img is not an image of format 1", shown(d))
+    }
+
+    @Test
+    fun theOtherReasonsOfTheWatcherAreOnTheBootScreenToo() = each { f ->
+        f.phone()
+        val d = bootScreen(f, processes = true)
+        File(f.session, "xnuhost.log").writeText("[1.000] xnuhost I stopping: PSCI SYSTEM_OFF (reason 0, code 0)\n[1.100] xnuhost I exit 0\n")
+        val w = watcher(f, max = 30)
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        f.assertInPlace()
+        assertEquals("iOS did not come up within 30 s", shown(d))
+        assertBootScreenEnded(f, d, f.returnLog)
+        // And what the log's end says, where xnuhost itself ended.
+        val g = Fake(f.sh)
+        g.phone()
+        val e = bootScreen(g, processes = true)
+        File(g.session, "xnuhost.log").writeText("[1.000] xnuhost I stopping: PSCI SYSTEM_OFF (reason 0, code 0)\n[1.100] xnuhost I exit 0\n")
+        File(g.session, "ready").createNewFile()
+        val v = watcher(g)
+        g.ends(XNUHOST)
+        assertTrue(v.waitFor(60, TimeUnit.SECONDS))
+        g.assertInPlace()
+        assertEquals("iOS stopped: PSCI SYSTEM_OFF (xnuhost exit 0)", shown(e))
+    }
+
+    /** On the scripts' text: optional, after the way back is armed, no key device, and never a reason for a gate to fail. */
+    @Test
+    fun theBootScreenIsOptionalAndLeavesTheWayBackAlone() {
+        val sw = code(switchScript).joinToString("\n")
+        val session = sw.substring(sw.indexOf("echo \"=== [1/5]"))
+        // It starts only after the way back is armed and checked, and before One UI's zygote stops.
+        val begin = session.indexOf("\nbootui_begin\n")
+        assertTrue(begin in session.indexOf("if [ -n \"\$armed\" ]; then") until session.indexOf("setprop ctl.stop zygote"))
+        // Everything of it: no key device, no property, no service, no signal, no wakelock, no return request, no reboot.
+        val helpers = sw.substring(sw.indexOf("BOOTUI=\"\$CTL/bootui\""), sw.indexOf("hard_reboot() {"))
+        val mode = sw.substring(sw.indexOf("    --bootui)"), sw.indexOf("    --keys)"))
+        for (never in listOf("getevent", "/dev/input", "setprop", "kill ", "ctl.", "wake_lock", "return.request", "reboot", "refuse", "exit 4", "> \"\$CTL/state\"")) {
+            assertFalse("the boot screen has '$never'", (helpers + mode).contains(never))
+        }
+        // Only files root staged and owns are run, and a missing one is the switch as it was before.
+        assertTrue(helpers.contains("[ -f \"\$BOOTBIN/\$f\" ] && root_only \"\$BOOTBIN/\$f\" ||"))
+        assertTrue(helpers.contains("BOOTBIN=\"\$STAGE/bin\"") && helpers.contains("BOOTUI=\"\$CTL/bootui\""))
+        val start = helpers.substring(helpers.indexOf("bootui_begin() {"), helpers.indexOf("log_scan() {"))
+        assertFalse(start, Regex("""(^|\s)exit [0-9]""").containsMatchIn(start.replace(". \"\$BOOTBIN/boot_status.sh\" || exit 1", "")))
+        // The watcher's own check of xnuhost does not rest on anything of the screen's.
+        val watch = sw.substring(sw.indexOf("    --watch)"), sw.indexOf("    session|--check) ;;"))
+        assertTrue(watch.contains("if ! { [ -n \"\$pid\" ] && [ \"\$(readlink \"\$P/\$pid/ns/mnt\" 2>/dev/null)\" = \"\$ns\" ]; }; then"))
+        // The return: ended in its first step, before the gates and before the branch for a switch that never
+        // stopped One UI; on every reboot; and nothing in it can fail the return.
+        val ret = code(returnScript).joinToString("\n")
+        val ended = ret.indexOf("\nbootui_end\n")
+        assertTrue(ended in ret.indexOf("step \"[1/5]") until ret.indexOf("step \"[2/5] Gate A"))
+        assertTrue(ended < ret.indexOf("if [ ! -e \"\$CTL/stopped\" ]"))
+        val reboot = ret.substring(ret.indexOf("do_reboot() {"), ret.indexOf("failsafe() {"))
+        assertTrue(reboot.indexOf("bootui_end") in 0 until reboot.indexOf("sys.powerctl"))
+        val end = ret.substring(ret.indexOf("BOOTUI=\$CTL/bootui"), ret.indexOf("wait_found() {"))
+        for (never in listOf("failsafe", "exit ", "setprop", "do_reboot")) assertFalse("the boot screen's end has '$never'", end.contains(never))
     }
 
     // --- Hardware checks: the check runner, with stand-ins for OneiOS's tools ----------

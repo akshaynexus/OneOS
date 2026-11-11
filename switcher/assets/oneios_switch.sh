@@ -14,13 +14,15 @@
 #   oneios_switch.sh --keys-poll TOK D.. (internal) the same chord from the keys' state (works under a grab)
 #   oneios_switch.sh --feed     (internal) Samsung's software watchdog feeder
 #   oneios_switch.sh --stop-loop (internal) keeps One UI's zygote stopped
+#   oneios_switch.sh --bootui   (internal) the boot screen's stage line, from xnuhost's log
 #
 # What a session never touches: One UI's /data beyond $STAGE (xnuhost's mount
 # namespace has the stage bound over /data), vold, keystore2, gatekeeper,
 # weaver, the lock-screen files, SELinux's mode, persist.* properties.
 # What it changes, all undone by oneios_return.sh or a reboot: One UI's zygote
 # (and zygote_secondary) stopped, the kernel wakelock oneios_session, Samsung's
-# software watchdog closed and fed, the cgroup oneios_session (xnuhost's own).
+# software watchdog closed and fed, the cgroup oneios_session (xnuhost's own),
+# OneOS's boot screen on a surfaceflinger layer until the guest's first frame.
 #
 # The ways back to One UI, none of which needs anything from the guest
 # (docs/oneios.md, "Getting back to One UI"):
@@ -148,10 +150,147 @@ end_display() {
     done
     return 0
 }
+# --- THE BOOT SCREEN -------------------------------------------------------
+# OneOS's own boot screen, the one an Android guest's switch shows
+# (boot_status.sh, its renderer OneOSBootStatus.dex, the OneOS icon;
+# docs/boot-status.md), from $STAGE/bin, which xnuhost's namespace has
+# read-only. From the stop of One UI's framework until the guest's first frame
+# it shows "Starting iOS 27", the boot stage read from xnuhost's log, and the
+# way back. Optional, like OneOS's: every failure here leaves the switch and
+# the way back exactly as they are without it. It reads no key and takes no
+# input device; its status files are in control/, where the guest cannot write.
+BOOTUI="$CTL/bootui"
+BOOTBIN="$STAGE/bin"
+bootui() { # <a function of boot_status.sh> [arguments]
+    [ -d "$BOOTUI" ] && [ -f "$BOOTBIN/boot_status.sh" ] || return 0
+    ( ONEOS_BOOT_DIR=$BOOTUI; ONEOS_BOOT_HOME=$BOOTBIN; . "$BOOTBIN/boot_status.sh" && "$@" ) >/dev/null 2>&1
+    return 0
+}
+# What is drawn comes from a log the guest writes: printable ASCII, one line, cut.
+plain() { printf '%s' "$1" | LC_ALL=C tr -c ' -~' ' ' | cut -c1-"${2:-200}"; }
+screen() { # <title|status> <text>
+    bootui oneos_boot_write "$1" "$(plain "$2")"
+}
+# Starts the screen (the session only). The renderer gets 3 s for its first
+# frame; with or without one the switch goes on.
+bootui_begin() {
+    [ "${ONEIOS_BOOTUI:-1}" != 0 ] || { echo "Boot screen: off (ONEIOS_BOOTUI=0)"; return 0; }
+    for f in boot_status.sh OneOSBootStatus.dex oneos_boot_icon.png; do
+        [ -f "$BOOTBIN/$f" ] && root_only "$BOOTBIN/$f" ||
+            { echo "Boot screen: $BOOTBIN/$f is not staged or not root's; the screen stays dark until iOS draws"; return 0; }
+    done
+    command -v app_process >/dev/null 2>&1 || { echo "Boot screen: no app_process; the screen stays dark until iOS draws"; return 0; }
+    (
+        ONEOS_BOOT_DIR=$BOOTUI; ONEOS_BOOT_HOME=$BOOTBIN; ONEOS_BOOT_MAX=1800
+        export ONEOS_BOOT_DIR ONEOS_BOOT_HOME ONEOS_BOOT_MAX
+        . "$BOOTBIN/boot_status.sh" || exit 1
+        oneos_boot_begin ios
+        oneos_boot_write status "Stopping One UI's framework"
+        oneos_boot_wait_ready 3
+    ) </dev/null >>"$CTL/bootui.log" 2>&1
+    rc=$?
+    [ -s "$BOOTUI/generation" ] || { echo "Boot screen: could not be started (log $CTL/bootui.log); the screen stays dark until iOS draws"; return 0; }
+    "$BB" setsid $SH "$SELF" --bootui </dev/null >>"$CTL/bootui.log" 2>&1 &
+    if [ $rc = 0 ]; then echo "Boot screen: up (renderer $(cut -d' ' -f1 "$BOOTUI/ready" 2>/dev/null), log $BOOTUI/renderer.log)"
+    else echo "Boot screen: the renderer posted no frame within 3 s (log $BOOTUI/renderer.log); the switch goes on"; fi
+    return 0
+}
+# xnuhost's log from byte $1 on (1 MiB at most): how far the boot got ($2 is the
+# stage so far) and what ended it. The stage markers are the Session logs
+# screen's nine (OneiosLogs.kt; docs/oneios.md, "Session logs"; OneiOS's
+# oneos/interface.md section 8), with the kernel's "OneiOS Data: first start"
+# between the root mount and launchd, where a new Data volume takes minutes.
+# Prints "S <stage>", "B" (a new boot began: xnuhost started the guest again
+# in place), "P <panic text>", "W <why xnuhost stops>", "X <exit code>",
+# "E <xnuhost's last error line>".
+log_scan() { # <first byte, from 1> <stage so far>
+    [ -f "$SESSION/xnuhost.log" ] && [ ! -L "$SESSION/xnuhost.log" ] || return 0
+    $TMO tail -c "+$1" "$SESSION/xnuhost.log" 2>/dev/null | head -c 1048576 | LC_ALL=C tr -d '\000' | LC_ALL=C awk -v st="$2" '
+        function s(n) { if (n > st) st = n }
+        { line = $0; sub(/^\[ *[0-9]+\.[0-9][0-9][0-9]\] /, "", line) }
+        line ~ /^guest / {
+            t = line; sub(/^guest +/, "", t)
+            if (index(t, "Darwin Kernel Version") == 1) s(3)
+            else if (index(t, "BSD root: ") == 1) s(4)
+            else if (index(t, "OneiOS Data: first start") == 1 || index(t, "OneiOS Data: unpacking the seed") == 1) s(5)
+            else if (index(t, "load_init_program: attempting to load") == 1) s(6)
+            else if (index(t, "com.apple.xpc.launchd|") == 1) s(7)
+            else if (panic == "" && t ~ /^panic\(cpu [0-9]+ caller 0x[0-9a-f]+\): /) { panic = t; sub(/^panic\([^)]*\): /, "", panic) }
+            if (index(t, "backboardd[")) s(8)
+            if (index(t, "SpringBoard[") || index(t, "crashed: SpringBoard.")) s(9)
+            next
+        }
+        line ~ /^xnuhost I / {
+            t = substr(line, 11)
+            if (index(t, "xnuhost: session ABI ") == 1) { st = 1; boot = 1; panic = ""; why = ""; code = ""; err = "" }
+            else if (index(t, "cpu0: entering the kernel at ") == 1) s(2)
+            else if (index(t, "guest ready: first frame") == 1) s(10)
+            else if (index(t, "stopping: ") == 1) { why = substr(t, 11); sub(/ \(reason [0-9]+, code [0-9]+\)$/, "", why) }
+            else if (t ~ /^exit [0-9]+$/) code = substr(t, 6)
+            next
+        }
+        line ~ /^xnuhost E / { err = substr(line, 11) }
+        END {
+            print "S " st
+            if (boot) print "B"
+            if (panic != "") print "P " panic
+            if (why != "") print "W " why
+            if (code != "") print "X " code
+            if (err != "") print "E " err
+        }'
+}
+stage_text() { # <stage of log_scan>
+    case "$1" in
+        1) echo "xnuhost is loading the kernel" ;;
+        2) echo "Entering the kernel" ;;
+        3) echo "Kernel started" ;;
+        4) echo "Root volume mounted" ;;
+        5) echo "Data volume: first start (this can take a few minutes)" ;;
+        6) echo "Loading launchd" ;;
+        7) echo "launchd is running" ;;
+        8) echo "backboardd started" ;;
+        9) echo "SpringBoard started" ;;
+        10) echo "iOS is up: waiting for its first frame" ;;
+    esac
+}
+# One line on why xnuhost ended, from the last 64 KiB of its log.
+why_ended() {
+    sz=$(stat -c %s "$SESSION/xnuhost.log" 2>/dev/null)
+    # (awk, not the shell: Android's sh counts in 32 bits.)
+    from=$(awk -v s="${sz:-0}" 'BEGIN { print (s + 0 > 65536) ? s - 65535 : 1 }')
+    log_scan "$from" 0 | awk '
+        /^P / { p = substr($0, 3) } /^W / { w = substr($0, 3) } /^X / { x = substr($0, 3) } /^E / { e = substr($0, 3) }
+        END {
+            if (p != "") print "iOS stopped: kernel panic: " p
+            else if (w != "") print "iOS stopped: " w (x != "" ? " (xnuhost exit " x ")" : "")
+            else if (x != "") print "xnuhost ended with exit " x (e != "" ? ": " e : "")
+            else if (e != "") print "xnuhost ended: " e
+            else print "xnuhost ended"
+        }'
+}
+# The display helper runs and has the guest's picture: its first frame is
+# posted, or xnuhost reported ready and the helper's layer is up. Its layer is
+# above the boot screen's, so the picture covers the boot screen first and the
+# boot screen is taken away under it.
+display_up() {
+    for dp in $(cat "$CTL/display.pid" 2>/dev/null); do
+        case "$(tr '\0' ' ' 2>/dev/null < "$P/$dp/cmdline")" in
+            *OneiOSDisplay*|*oneios-display*) ;;
+            *) continue ;;
+        esac
+        grep -q 'oneios-display: first frame posted' "$CTL/display.log" 2>/dev/null && return 0
+        [ -e "$SESSION/ready" ] && grep -q 'oneios-display: layer up' "$CTL/display.log" 2>/dev/null && return 0
+    done
+    return 1
+}
+TMO=""
+command -v timeout >/dev/null 2>&1 && TMO="timeout 5"
+
 # The reboot return without oneios_return.sh, for the watcher when that script
 # cannot be run or ends with an error: the same three steps as its failsafe.
 hard_reboot() { # <reason word> <why>
     echo "$(date '+%F %T') watcher: $2 - rebooting into One UI"
+    bootui oneos_boot_stop
     echo "failsafe $(date +%s) $2" > "$STAGE/return.outcome"
     sync
     setprop sys.powerctl "reboot,$1"
@@ -366,6 +505,81 @@ case "$MODE" in
         done
         exit 0
         ;;
+    --bootui)
+        # The boot screen's status line (bootui_begin starts this beside the
+        # renderer): once a second, the furthest boot stage in what xnuhost's
+        # log gained, a kernel panic, or why xnuhost ended. It hands the screen
+        # to the display helper when the guest's picture is up (display_up)
+        # and leaves when a return begins: the return ends the screen. It
+        # reads the log and control/, and writes only $BOOTUI.
+        gen=$(cat "$BOOTUI/generation" 2>/dev/null)
+        [ -n "$gen" ] || exit 0
+        echo $$ > "$BOOTUI/feeder.pid"
+        live() { [ "$(cat "$BOOTUI/generation" 2>/dev/null)" = "$gen" ] && [ ! -e "$BOOTUI/stop" ]; }
+        show() {
+            [ "$1" = "$shown" ] && return 0
+            shown=$1
+            screen status "$1"
+            echo "$(date '+%F %T') boot screen: $(plain "$1")"
+        }
+        off=0 st=0 shown="" panic="" t=0 drawn=0 native=0
+        while live; do
+            state=$(cat "$CTL/state" 2>/dev/null)
+            case "$state" in starting|running) ;; *) break ;; esac
+            if display_up; then
+                echo "$(date '+%F %T') boot screen: the guest's picture is on the display helper's layer; the boot screen ends"
+                bootui oneos_boot_stop
+                break
+            fi
+            # The display helper, once it connects in a takeover, sets the
+            # display's projection to the panel's own mode and leaves it so
+            # (One UI's resolution setting may be smaller). The boot screen
+            # then draws for that size: the renderer reads this file.
+            if [ $native = 0 ] && grep -q 'oneios-display: display projection set to the active mode' "$CTL/display.log" 2>/dev/null; then
+                native=1
+                bootui oneos_boot_write native 1
+                echo "$(date '+%F %T') boot screen: the display helper set the projection to the panel's mode; drawing at that size"
+            fi
+            # A renderer that never posted a frame is not retried for the whole session.
+            [ -s "$BOOTUI/ready" ] && drawn=1
+            if [ $drawn = 0 ] && [ $t -ge 30 ]; then
+                echo "$(date '+%F %T') boot screen: the renderer posted no frame in 30 s (log $BOOTUI/renderer.log); the boot screen ends"
+                bootui oneos_boot_stop
+                break
+            fi
+            # What the log gained since the last look, with 511 bytes before it
+            # (a marker cut in two by the last read; a stage is only ever raised).
+            size=$(stat -c %s "$SESSION/xnuhost.log" 2>/dev/null)
+            set -- $(awk -v s="${size:-0}" -v o="$off" 'BEGIN {
+                s += 0; o += 0; if (s < o) o = 0
+                if (s == o) { print "-", o; exit }
+                f = (o > 511) ? o - 510 : 1
+                e = (s - f + 1 > 1048576) ? f + 1048575 : s
+                print f, e }')
+            if [ "$1" != - ]; then
+                out=$(log_scan "$1" "$st")
+                off=$2
+                n=$(printf '%s\n' "$out" | sed -n 's/^S //p' | head -n 1)
+                case "$n" in ''|*[!0-9]*) ;; *) st=$n ;; esac
+                printf '%s\n' "$out" | grep -q -x B && panic=""
+                found=$(printf '%s\n' "$out" | sed -n 's/^P //p' | head -n 1)
+                [ -z "$found" ] || panic=$found
+            else
+                off=$2
+            fi
+            gone=0
+            if [ "$state" = running ]; then
+                xp=$(cat "$CTL/xnuhost.pid" 2>/dev/null)
+                [ -n "$xp" ] && [ "$(readlink "$P/$xp/ns/mnt" 2>/dev/null)" = "$(cat "$CTL/mntns" 2>/dev/null)" ] || gone=1
+            fi
+            if [ $gone = 1 ]; then show "$(why_ended)"
+            elif [ -n "$panic" ]; then show "Kernel panic: $panic"
+            elif [ "$st" -gt 0 ]; then show "$(stage_text "$st")"
+            fi
+            sleep 1; t=$((t + 1))
+        done
+        exit 0
+        ;;
     --keys)
         # Volume Up + Volume Down held 3 s, from one key device's events.
         # getevent only reads: it never grabs (EVIOCGRAB), so the guest still
@@ -439,8 +653,13 @@ case "$MODE" in
         MAX="${ONEIOS_RETURN_MAX:-600}"
         case "$MAX" in ''|*[!0-9]*) MAX=600 ;; esac
         awake() { echo oneios_session 2>/dev/null > "$T/sys/power/wake_lock"; }
+        SCREEN=""
         go() {
             echo "$(date '+%F %T') watcher: $*; returning to One UI"
+            # The boot screen, while it is still up, says so (and why, in
+            # $SCREEN) until the return ends it.
+            screen title 'Returning to One UI'
+            [ -z "$SCREEN" ] || screen status "$SCREEN"
             # The guest's picture goes first: nothing of the return waits for it.
             end_display
             # Not exec: a return script that cannot be run (gone, damaged) or
@@ -453,14 +672,15 @@ case "$MODE" in
         }
         t=0
         while [ "$(cat "$CTL/state" 2>/dev/null)" = starting ]; do
-            [ -e "$SESSION/return.request" ] && go "return asked before xnuhost started ($(head -c 200 "$SESSION/return.request" 2>/dev/null))"
-            [ $t -lt 60 ] || go "the switch did not start xnuhost within 60 s"
+            [ -e "$SESSION/return.request" ] && SCREEN="A return to One UI was asked for" && go "return asked before xnuhost started ($(head -c 200 "$SESSION/return.request" 2>/dev/null))"
+            [ $t -lt 60 ] || { SCREEN="iOS did not start within 60 s"; go "the switch did not start xnuhost within 60 s"; }
             sleep 1; t=$((t + 1))
         done
         case "$(cat "$CTL/state" 2>/dev/null)" in
             running) ;;
             # A return someone else started (the app, adb, the key readers): theirs.
             returning|returned) echo "$(date '+%F %T') watcher: a return is under way or done; nothing to do"; exit 0 ;;
+            # (The switch wrote why on the boot screen.)
             *) go "the switch ended in state '$(cat "$CTL/state" 2>/dev/null)'" ;;
         esac
         pid=$(cat "$CTL/xnuhost.pid" 2>/dev/null)
@@ -473,10 +693,13 @@ case "$MODE" in
             case "$(cat "$CTL/state" 2>/dev/null)" in
                 returning|returned) echo "$(date '+%F %T') watcher: a return is under way or done; nothing to do"; exit 0 ;;
             esac
-            [ -e "$SESSION/return.request" ] && go "return asked ($(head -c 200 "$SESSION/return.request" 2>/dev/null))"
-            [ -n "$pid" ] && [ "$(readlink "$P/$pid/ns/mnt" 2>/dev/null)" = "$ns" ] ||
+            [ -e "$SESSION/return.request" ] && SCREEN="A return to One UI was asked for" && go "return asked ($(head -c 200 "$SESSION/return.request" 2>/dev/null))"
+            if ! { [ -n "$pid" ] && [ "$(readlink "$P/$pid/ns/mnt" 2>/dev/null)" = "$ns" ]; }; then
+                SCREEN=$(why_ended)
                 go "xnuhost $pid ended (last log lines: $(tail -n 3 "$SESSION/xnuhost.log" 2>/dev/null | tr '\n' '|' | cut -c1-300))"
+            fi
             if [ "$MAX" -gt 0 ] && [ ! -e "$SESSION/ready" ] && [ $t -ge "$MAX" ]; then
+                SCREEN="iOS did not come up within ${MAX} s"
                 go "the guest did not report ready within ${MAX}s"
             fi
             # Nothing else keeps the phone awake with One UI's framework gone:
@@ -679,6 +902,8 @@ echo "Return to One UI: hold Volume Up + Volume Down for 3 s (key devices: $(ech
 echo "If that does nothing: hold Power + Volume Down until the phone restarts (about 7 s). It restarts into One UI."
 
 echo "=== [3/5] $(date +%T) Stopping the One UI framework ==="
+# The boot screen first, so that it is up when One UI's windows go.
+bootui_begin
 # The watchdog device(s) One UI's system_server keeps open, before it stops
 # (oneos_switch.sh [4b/6]: recorded for the feeder).
 for p in $(pidof system_server); do
@@ -708,6 +933,7 @@ echo $! > "$CTL/feeder.pid"
 echo "One UI's zygote: $(getprop init.svc.zygote); system_server: $(pidof system_server 2>/dev/null || echo gone); surfaceflinger $(pidof surfaceflinger) kept"
 
 echo "=== [4/5] $(date +%T) Starting xnuhost ==="
+screen status "Starting xnuhost"
 # A new mount namespace made from init's; --inner binds the stage over /data
 # there and execs xnuhost, so the pid it writes is xnuhost's own.
 "$BB" setsid "$BB" unshare -m /system/bin/sh "$SELF" --inner </dev/null >>"$SESSION/xnuhost.log" 2>&1 &
@@ -717,6 +943,7 @@ XP=$(cat "$SESSION/xnuhost.pid" 2>/dev/null)
 XNS=$(readlink "/proc/$XP/ns/mnt" 2>/dev/null)
 if [ -z "$XP" ] || [ -z "$XNS" ] || [ "$XNS" = "$INIT_NS" ]; then
     echo "!!! xnuhost did not start (pid '${XP}', namespace '${XNS}'): $(tail -n 5 "$SESSION/xnuhost.log" | tr '\n' '|')"
+    screen status "xnuhost did not start: $(grep . "$SESSION/xnuhost.log" 2>/dev/null | tail -n 1)"
     echo failed > "$CTL/state"
     # The watcher sees the state and returns; nothing else to undo here.
     exit 4

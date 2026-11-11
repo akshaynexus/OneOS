@@ -23,6 +23,15 @@ object OneiosRoot {
     /** The session scripts root stages beside the runtime and the image (switcher/assets). */
     val SESSION_SCRIPTS: List<String> = listOf("oneios_switch.sh", "oneios_return.sh")
 
+    /**
+     * OneOS's boot screen (the Android guests' own: its script, its renderer and the OneOS icon), which the
+     * switch shows from the stop of One UI's framework until iOS draws. Root stages them in the stage's `bin/`.
+     */
+    val BOOT_SCREEN_FILES: List<String> = listOf("boot_status.sh", "OneOSBootStatus.dex", "oneos_boot_icon.png")
+
+    /** Everything the `script` verb takes: staged with every import and before every switch. */
+    val SESSION_FILES: List<String> = SESSION_SCRIPTS + BOOT_SCREEN_FILES
+
     enum class Stdin { NONE, SCRIPT, DATA }
 
     enum class Verb(val word: String, val stdin: Stdin) {
@@ -99,7 +108,7 @@ object OneiosRoot {
             }
             Verb.SCRIPT -> {
                 need(3)
-                args.getOrNull(0)?.let { if (it !in SESSION_SCRIPTS) p += "script: '${it.take(40)}' is not a session script" }
+                args.getOrNull(0)?.let { if (it !in SESSION_FILES) p += "script: '${it.take(40)}' is not a session script" }
                 arg(1, DEC, "a size"); arg(2, HEX64, "a SHA-256")
             }
             Verb.FINISH -> when (args.getOrNull(0)) {

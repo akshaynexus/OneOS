@@ -228,6 +228,14 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         val profile = Profiles.resolve(FactProbe(app).collect(RootProbe(app).signals())).profile
         val gate = OneiosSystem.gate(profile, ticked)
         if (gate.level != Level.OK) throw Failed(if (gate.level == Level.BLOCK) gate.detail else "Tick the box first: ${gate.title}.")
+        // This build's session scripts and boot screen, before every switch: an app update reaches the stage
+        // without a new import. A refusal here (no stage yet, an open session) is not the answer: root's
+        // preflight below gives that, and a stage that keeps its earlier scripts switches as it did before.
+        for (s in sessionFiles(app)) {
+            if (cancelled) throw Failed("stopped")
+            val staged = root(app, OneiosRoot.Verb.SCRIPT, listOf(s.name, s.bytes.size.toString(), s.sha256), RootShell.Feed { it.write(s.bytes) })
+            if (!staged.ok) break
+        }
         must(root(app, OneiosRoot.Verb.SWITCH, listOf(BuildConfig.VERSION_CODE.toString(), "1"), silenceMs = 180_000))
         "Switching to ${OneiosSystem.SHORT_NAME}…"
     }
@@ -274,13 +282,23 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         update(state.copy(done = m.done, total = m.total, bytesPerSecond = m.bytesPerSecond, etaSeconds = m.etaSeconds))
     }
 
-    private fun stage(app: Context, kind: OneiosKind, open: () -> InputStream): OneiosManifest {
-        val scripts = listOf("oneios_switch.sh" to BuildConfig.ONEIOS_SWITCH_SHA256, "oneios_return.sh" to BuildConfig.ONEIOS_RETURN_SHA256).map { (name, pin) ->
-            // The session scripts this build pins, with every staging: they are small, and always this app's.
+    /**
+     * The session scripts and OneOS's boot screen files this build pins: they are small, and always this app's.
+     * Root stages them with every import and before every switch.
+     */
+    private fun sessionFiles(app: Context): List<OneiosImport.Script> {
+        val boot = BuildConfig.ONEIOS_BOOT_SCREEN_SHA256.split(',').map { it.substringBefore('=') to it.substringAfter('=') }
+        if (boot.map { it.first } != OneiosRoot.BOOT_SCREEN_FILES) throw Failed("the boot screen files in the app are not the pinned ones")
+        val pins = listOf("oneios_switch.sh" to BuildConfig.ONEIOS_SWITCH_SHA256, "oneios_return.sh" to BuildConfig.ONEIOS_RETURN_SHA256) + boot
+        return pins.map { (name, pin) ->
             val b = app.assets.open("oneios/$name").use { it.readBytes() }
             if (Hashes.sha256(b) != pin) throw Failed("$name in the app is not the pinned one")
             OneiosImport.Script(name, b, pin)
         }
+    }
+
+    private fun stage(app: Context, kind: OneiosKind, open: () -> InputStream): OneiosManifest {
+        val scripts = sessionFiles(app)
         val root = object : OneiosImport.Root {
             override fun run(verb: OneiosRoot.Verb, args: List<String>, feed: RootShell.Feed?, silenceMs: Long): String? {
                 val r = root(app, verb, args, feed, silenceMs)

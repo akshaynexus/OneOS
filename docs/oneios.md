@@ -48,7 +48,9 @@ Choose a system → **iOS 27 (OneiOS)** → Open (`OneiosActivity`, `OneiosJob`)
   xnuhost, the program that runs iOS, comes with it"). How the last session returned.
 - *Back to One UI*, shown while a session is still open and the app runs (root's `return` verb starts
   `oneios_return.sh`; with no open session it does nothing).
-- The experimental tick and **Switch to iOS 27**, enabled only with the tick and a passing preflight.
+- The experimental tick and **Switch to iOS 27**, enabled only with the tick and a passing preflight. From
+  0.4.80 the switch first stages this build's two session scripts and the boot screen's three files again, so an
+  app update reaches the stage without a new import (before, only an import staged them).
 - *Remove the iOS files*.
 - **Hardware checks**: a screen of its own (`OneiosChecksActivity`), below.
 - **Session logs**: a screen of its own (`OneiosLogsActivity`), below.
@@ -261,12 +263,13 @@ and neither kind of session starts while the other's stage has anything mounted.
 | Path | What |
 |---|---|
 | `bin/oneios_root.sh` | the app's root script; the launcher runs it only with the SHA-256 pinned in BuildConfig |
-| `oneios_switch.sh`, `oneios_return.sh` | the session scripts, pinned the same way, staged with every import |
+| `oneios_switch.sh`, `oneios_return.sh` | the session scripts, pinned the same way, staged with every import and before every switch |
+| `bin/boot_status.sh`, `bin/OneOSBootStatus.dex`, `bin/oneos_boot_icon.png` | OneOS's boot screen (below), the same three files an Android guest's stage holds, pinned and staged like the session scripts |
 | `runtime/`, `runtime.conf`, `runtime.sha256`, `runtime.ids` | the unpacked runtime; its version, session ABI, xnuhost path and image formats; every file's SHA-256; every file's `dev:inode:size:mtime` |
 | `image/`, `image.conf`, `image.sha256`, `image.ids` | the same for the image set |
 | `data/` | iOS's own writable state. A new runtime or image keeps it; Remove deletes it |
 | `session/` | what xnuhost and the switch share in the running or last session: `xnuhost.log`, `xnuhost.pid`, `ready`, `return.request`, `display.sock`, `tmp/` |
-| `control/` | the way back's own: the session's state, the baseline, xnuhost's pid and namespace as the switch recorded them, the watcher's and key readers' pids, the return's lock and guard. Read-only in xnuhost's namespace, like the two session scripts and `bin/` |
+| `control/` | the way back's own: the session's state, the baseline, xnuhost's pid and namespace as the switch recorded them, the watcher's and key readers' pids, the return's lock and guard; `bootui/` (the boot screen's status files and pids) and `bootui.log` (the switch's lines about it). Read-only in xnuhost's namespace, like the two session scripts and `bin/` |
 | `logs/` | the five sessions before the last: `xnuhost-<epoch>.log`, moved there by the next switch (the epoch is that switch's time; the file's own time is its session's last line) |
 | `checks/` | the hardware checks' own: each check's last output (`<id>.log`), the camera pictures (`camera.png`, `camera-hal.png`), the values to put back (`saved.backlight`, `saved.als`), the tools' temporary files |
 | `switch.log`, `return.log`, `return.outcome` | the switch's output; the return's, the watcher's and the key readers'; how the last return ended. `control/display.log` and `control/watchdog_feeder.log` are the display helper's and the watchdog feeder's |
@@ -293,8 +296,8 @@ runtime with xnuhost is staged, this is where every switch ends.**
    watcher, a `getevent` reader per volume-key device, and a poll of the keys' state. A kernel wakelock
    (`oneios_session`) keeps the phone awake without One UI's power manager. **One UI is not stopped unless all
    of them run and the wakelock is held**; if not, the switch ends there.
-3. One UI's zygote and zygote_secondary are stopped, so system_server and every app end; a loop keeps them
-   stopped. surfaceflinger, the vendor composer, audioserver, netd, vold, keystore2 and the radio keep running.
+3. The boot screen starts (below), then One UI's zygote and zygote_secondary are stopped, so system_server and
+   every app end; a loop keeps them stopped. surfaceflinger, the vendor composer, audioserver, netd, vold, keystore2 and the radio keep running.
    Samsung's software watchdog gets its magic close and a feeder, as in an Android session.
 4. xnuhost starts in a **new mount namespace** in which the stage is bound over `/data`; `runtime`, `image`,
    `control`, `bin` and the two session scripts are read-only there. It gets a cgroup of its own
@@ -310,7 +313,8 @@ runtime with xnuhost is staged, this is where every switch ends.**
 
 1. **The session ends.** SIGTERM to xnuhost, 20 s; then everything that is left is killed: the cgroup at once
    (`cgroup.kill`), every process in xnuhost's mount namespace, and every process outside init's namespace whose
-   mount table still shows the stage. The key readers and the watcher end.
+   mount table still shows the stage. The key readers and the watcher end. The boot screen, where it is still
+   up, says "Returning to One UI" during this step and is ended at its end, before the first gate.
 2. **Gate A.** No such process is left; the stage is mounted in no process's mount table (every namespace, not
    only init's: OneOS's run 45); nothing was mounted on One UI's partitions; the same boot; vold, keystore2 and
    servicemanager have their pids of the switch; the daemons One UI cannot restart are running; SELinux is as
@@ -331,6 +335,83 @@ A failed check anywhere is the failsafe: `sys.powerctl reboot,oneios-inplace-fai
 busybox into an Android guest's `/data`). `oneios_return.sh reboot` goes straight there. A return with no open session does
 nothing, and a switch that ended before it stopped One UI's zygote (the stop is marked in `control/stopped`)
 only has its helpers ended: neither restarts anything.
+
+## Boot screen
+
+From the stop of One UI's framework until iOS draws, the screen shows **OneOS's own boot screen**, the one a
+switch to an Android guest shows. Before 0.4.80 it went black there, and since iOS does not draw a frame yet, a
+session looked like black and then One UI again, as if the phone had restarted. **Not run on the phone yet.**
+
+What is reused, not written again (`docs/boot-status.md`):
+
+| Piece | For an Android guest | For iOS |
+|---|---|---|
+| `boot_status.sh`: the status files (`title`, `status`, `verbose`, `generation`, `ready`, `stop`), the supervisor that restarts the renderer when surfaceflinger changes | `oneos_boot_begin enter` / `restart` / `return`, status directory `<Android stage>/data/oneos_bootui` | `oneos_boot_begin ios`, status directory `control/bootui`, the files from the stage's `bin/` (`ONEOS_BOOT_HOME`) |
+| `OneOSBootStatus.dex` (`switcher/patches/OneOSBootStatus.java`): a root `app_process` that draws on a SurfaceControl BLAST layer at z 2,000,000,000 | icon, title, and the status line with Verbose boot on | the same, with the status line always on and a `hint` file drawn near the bottom edge (status and hint wrap) |
+| `oneos_boot_icon.png` | the OneOS icon | the same icon. **No Apple logo, name or mark is drawn**: the title is the text "Starting iOS 27" |
+| Where the status comes from | Android's boot events (`logcat -b events`) and the scripts' `ctl.start` / `ctl.stop` | the switch's feeder (`oneios_switch.sh --bootui`), from `session/xnuhost.log`; the supervisor's `ios` mode reads no Android event and does not wait for a boot animation |
+| How it ends | the new framework's display-ready event or its boot animation's end; at most 600 s | the stop flag: at the hand-off, at the return, or after 1800 s |
+
+**What it shows.** The OneOS icon; the title **Starting iOS 27**; one status line; and near the bottom edge
+**Hold Volume Up + Volume Down for 3 s to go back to One UI**. The status line:
+
+| When | Status |
+|---|---|
+| the screen is up, One UI's zygote is being stopped | Stopping One UI's framework |
+| step 4 begins | Starting xnuhost |
+| `xnuhost I xnuhost: session ABI` | xnuhost is loading the kernel |
+| `xnuhost I cpu0: entering the kernel at` | Entering the kernel |
+| console `Darwin Kernel Version` | Kernel started |
+| console `BSD root: ` | Root volume mounted |
+| console `OneiOS Data: first start` or `OneiOS Data: unpacking the seed` | Data volume: first start (this can take a few minutes) |
+| console `load_init_program: attempting to load` | Loading launchd |
+| console `com.apple.xpc.launchd\|` | launchd is running |
+| the first console line with `backboardd[` | backboardd started |
+| the first with `SpringBoard[` or `crashed: SpringBoard.` | SpringBoard started |
+| `xnuhost I guest ready: first frame` | iOS is up: waiting for its first frame |
+| console `panic(cpu N caller 0x...): TEXT` | Kernel panic: TEXT |
+| xnuhost ended | iOS stopped: kernel panic: TEXT; or iOS stopped: WHY (xnuhost exit N), from `stopping: WHY` and `exit N`; or xnuhost ended with exit N; or xnuhost ended: its last `xnuhost E` line |
+| xnuhost never started | xnuhost did not start: the log's last line |
+| the watcher returns | the title becomes **Returning to One UI**; the status is the reason above, or "A return to One UI was asked for", "iOS did not start within 60 s", "iOS did not come up within 600 s" |
+| a return from the app, by hand or from the key readers | **Returning to One UI**, Stopping iOS |
+
+The stage markers are the Session logs screen's nine (`OneiosLogs.kt`, above), with the kernel's two `OneiOS
+Data:` lines between the root mount and launchd (a new Data volume is made and its seed unpacked there, which
+takes minutes with nothing else to see). The furthest stage seen is shown; when xnuhost starts the guest again in
+place, the stages start again. The feeder looks once a second at what the log gained (at most 1 MiB a look). The
+log is the guest's to write, so what is drawn from it is cut to 200 characters of printable ASCII.
+
+**The hand-off.** The display helper's layer is above the boot screen's (z 2,147,483,646 against 2,000,000,000)
+and opaque. So when the helper posts the guest's first frame, that picture covers the boot screen, and the
+feeder then stops the boot screen under it: it sees `oneios-display: first frame posted` in
+`control/display.log` with the helper still running, or `session/ready` with the helper running and its
+`oneios-display: layer up`. This is how OneOS hands its boot screen to a guest's compositor: the new picture
+first, then the stop flag, and the renderer takes its own layer away. **While iOS shows nothing, the boot screen
+stays**: `ready` without a running helper leaves it up ("iOS is up: waiting for its first frame"), because
+taking it away would leave a black screen with no way back written on it. It is not brought back if the helper
+ends later.
+
+**The size.** The renderer draws for the logical size One UI's display manager gave it (1080 x 2340 with One
+UI's resolution set to FHD+). The display helper, when it connects in a takeover, sets the display's projection
+to the panel's own mode and leaves it so. The feeder sees its `oneios-display: display projection set to the
+active mode` and writes `native` to the status directory; the renderer then draws for the active mode's size.
+
+**The return** ends it on every path. `oneios_return.sh` writes the title, and at the end of its first step
+(before Gate A, and before the branch for a switch that never stopped One UI) sets the stop flag and a new
+generation, which retire the supervisor, the renderer (it removes its layer) and the feeder; the feeder is
+killed at once, the other two after a second if they are still there, each by its pid and only while that pid is
+still the same program. The same happens before every reboot the return asks for (the failsafe, the guard, the
+reboot return); the watcher's own reboot sets the stop flag. The three processes are One UI-side: init's mount
+namespace, the root cgroup, never the session's, so the gates do not count them, and a renderer that could not
+be ended is logged and nothing more: Gate B restarts the composer and surfaceflinger, which drops every layer.
+
+**Optional, like OneOS's** ("every failure leaves the original boot/return path intact"). The screen starts only
+after the way back is armed and checked. If one of the three files is not staged or not root's, if there is no
+`app_process`, or if the renderer posts no frame, the switch goes on exactly as before 0.4.80 (the renderer gets
+3 s before One UI is stopped, and is given up after 30 s without a frame). Nothing of the watcher, the key
+readers, the poll or the gates reads anything of the boot screen's. It opens no input device (`getevent` stays
+the only reader of the keys, and it does not grab), sets no property, holds no wakelock and stops no service.
+`ONEIOS_BOOTUI=0` (over adb) turns it off.
 
 ## Getting back to One UI
 
@@ -367,8 +448,9 @@ surfaceflinger and requires both back. A GPU that does not recover fails those c
 the reboot. A process the kernel cannot end (stuck in a driver) fails Gate A: reboot.
 
 Not ported from OneOS's return: holding the composer (`oneos_boot_hold_display`). It keeps the return splash's
-last frame on the panel while no surfaceflinger exists; an iOS session has no return splash, and the composer's
-client here is One UI's own surfaceflinger, which a stopped composer would only block.
+last frame on the panel while no surfaceflinger exists; an iOS session's boot screen is ended before the gates
+("Boot screen", above), and the composer's client here is One UI's own surfaceflinger, which a stopped composer
+would only block. So from the end of the return's first step to One UI's boot animation the screen is black.
 
 **The hardware restart (7).** Holding the Side (Power) key and Volume Down together for about 7 seconds is the
 phone's forced restart. It is done by the PMIC, below Android's kernel and everything in this session: the two
@@ -425,6 +507,20 @@ the two meet at the return's lock.
   come back, no system_server, a user that never unlocks), for a return that hangs (the guard) and for a
   return whose lock holder is gone. These are the scripts' logic, not the phone: `getevent`'s `*` mark, cgroup
   v2, the composer restart and the forced restart are still to be seen on the S24 Ultra.
+- **The boot screen.** `OneiosScriptTest`, under each shell: root stages the three files in `bin/` and takes no
+  other name; `boot_status.sh`'s `oneos_boot_begin ios` writes the title, the hint and the icon, and its
+  supervisor in the `ios` mode starts the renderer with the bound, reads no Android boot event and ends on the
+  stop flag; the feeder shows each stage from real log lines (one after a megabyte of console), keeps the
+  furthest, starts again at a restart in place, shows a panic as printable ASCII and then why xnuhost ended,
+  signals nothing and asks nothing of init; the hand-off at the helper's first frame and at `ready` with its
+  layer up, and no hand-off for `ready` alone, a helper without a frame, or a stale pid; a renderer that never
+  drew is given up; the return ends the screen before Gate A in place, on a failsafe, on the reboot return, for
+  a switch that never stopped One UI and from the watcher (with the reason on the screen); a renderer that
+  cannot be killed or a stale pid file is logged and One UI still comes back in place; and on the scripts' text:
+  it starts after the way back is armed, has no key device, property, signal or reboot in it, and its end cannot
+  fail the return. `scripts/test-boot-status.py` and `test-guest-restart-splash.py` (the Android guests' use of
+  the same script) pass unchanged. Not covered by any test: the renderer itself (`app_process` and
+  surfaceflinger exist only on the phone), so the layout with the hint has not been seen.
 - **Hardware checks.** `core/model` `OneiosChecksTest`: the reading of each tool's output (bridgectl's five
   commands, gpuctl, displayctl, brightctl's three, camctl's list and capture with every failure line of its
   README), a missing tool, a tool ended at its limit, root's result lines, the shared text. `OneiosScriptTest`,
@@ -483,6 +579,14 @@ debug build too: Android guests that already hold upstream's release-signed one 
 
 ## Not done yet
 
+- **The boot screen has not run on the phone** (0.4.80). Unknown until it does: whether `app_process` starts
+  the renderer from the iOS stage's `bin/` (the Android guests run it from their own stage, which is tested on
+  the Fold8); whether One UI's surfaceflinger keeps showing the layer once system_server is gone (OneOS's
+  Verbose boot relies on the same); how the hint and a long reason look on the S24 Ultra's panel. OneiOS's
+  `oneos/interface.md` section 8 should name the lines this reads beyond the nine stages: the console's
+  `OneiOS Data: first start` and `OneiOS Data: unpacking the seed`, and the display helper's
+  `oneios-display: first frame posted`, `oneios-display: layer up` and
+  `oneios-display: display projection set to the active mode`.
 - **Session logs have not run on the phone.** The two screens were compiled, never opened on a device; the root
   verbs and the parser ran under bash and mksh on the PC against fake stages and OneiOS's PC boot logs. A phone
   session's log may have lines the PC's never had: the summary names only what it finds.
@@ -501,7 +605,7 @@ debug build too: Android guests that already hold upstream's release-signed one 
   /dev/input/event0` with Volume Up held shows `KEY_VOLUMEUP*`; `/sys/fs/cgroup/cgroup.controllers` exists; a
   session returns on the chord; it returns with `kill -9` of xnuhost and with `kill -STOP` of it (the keys
   still work); the composer restart brings One UI's display back; Power + Volume Down restarts into One UI.
-- Left undone in the way back (2026-11-10): no return splash, so nothing like OneOS's composer hold; no
+- Left undone in the way back (2026-11-10): no return splash after the boot screen ends, so nothing like OneOS's composer hold; no
   "Back to One UI" inside iOS (xnuhost's `XH_HALT_RETURN` is there, nothing in the guest calls it); the watcher
   does not restart a key reader that died (the poll and the other readers cover it); the Bluetooth, camera and
   vibrator HALs are not restarted at the return (OneiOS's bridges are to name the ones that need it); the CI
@@ -509,7 +613,7 @@ debug build too: Android guests that already hold upstream's release-signed one 
 - The display helper xnuhost asks for (a root SurfaceControl layer that shows the frames of
   `session/display.sock`) is not written. When it is, it belongs to the session: started after xnuhost, in its
   cgroup, so that the return ends it with the rest.
-- No boot or return splash for iOS, no log collection in the app (the logs are in the stage), no Quick switch.
+- No return splash for iOS (the boot screen ends before the return's gates), no Quick switch.
 - Wi-Fi: One UI's supplicant leaves with its framework. Networking in the guest is xnuhost's to solve.
 - The image format follows `oneos/interface.md` until OneiOS's `docs/image-format.md` is written.
 - The app update, release scripts and the Probe edition know nothing of iOS.

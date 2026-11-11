@@ -249,13 +249,21 @@ do_receive() {
 
 do_script() {
     [ $# -eq 3 ] || usage "script <name> <bytes> <sha256>"
-    case "$1" in oneios_switch.sh|oneios_return.sh) ;; *) usage "script: '$1'" ;; esac
+    case "$1" in
+        oneios_switch.sh|oneios_return.sh) to="$STAGE/$1"; mode=0700 ;;
+        # OneOS's boot screen, which the switch shows until iOS draws (docs/oneios.md, "Boot screen"): in bin/,
+        # which the session's namespace has read-only, like the two scripts.
+        # (0644, the modes the Android guests' stage gives them: app_process loads the dex as it does there.)
+        boot_status.sh|OneOSBootStatus.dex|oneos_boot_icon.png) to="$STAGE/bin/$1"; mode=0644 ;;
+        *) usage "script: '$1'" ;;
+    esac
     is_dec "$2" && [ "$2" -ge 1 ] && [ "$2" -le $SCRIPT_MAX ] || usage "script: size '$2'"
     is_hex64 "$3" || usage "script: SHA-256"
     stage_ok
     session_open && refuse "an iOS session is running: return to One UI first"
-    [ ! -L "$STAGE/$1" ] || refuse "$STAGE/$1 is a link"
-    take "$STAGE/$1" "$2" "$3" 0700
+    [ -d "${to%/*}" ] && mine "${to%/*}" || refuse "${to%/*} is missing or not root's"
+    [ ! -L "$to" ] || refuse "$to is a link"
+    take "$to" "$2" "$3" "$mode"
     say "@@OK script $1"
 }
 
