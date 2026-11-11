@@ -51,6 +51,7 @@ Choose a system → **iOS 27 (OneiOS)** → Open (`OneiosActivity`, `OneiosJob`)
 - The experimental tick and **Switch to iOS 27**, enabled only with the tick and a passing preflight.
 - *Remove the iOS files*.
 - **Hardware checks**: a screen of its own (`OneiosChecksActivity`), below.
+- **Session logs**: a screen of its own (`OneiosLogsActivity`), below.
 
 Importing either package: the app reads the tar twice. First for the manifest, which it parses and checks
 (`OneiosManifests.parse`: format version, plain relative paths, sizes, SHA-256s, no duplicates; a runtime must
@@ -71,7 +72,7 @@ release `v0.1.0` is the first that has them all), so the screen uses the staged 
 | Row | Command (in `runtime/bin`) | Limit | Said before it runs |
 |---|---|---|---|
 | CPU layout | `bridgectl cpu` | 15 s | |
-| GPU | `gpuctl` (Adreno through drm2kgsl and udmabuf) | 30 s | |
+| GPU | `gpuctl` (Adreno through drm2kgsl and udmabuf; from runtime 0.1.5 all its steps: nodes, routes, probe, submit, large) | 120 s | |
 | Display layer | `displayctl test` | 30 s | colour bars over the whole screen for 5 s |
 | Haptics | `bridgectl haptic 200 1000` | 10 s | the phone buzzes once |
 | Haptics pattern | `bridgectl haptic-pattern` | 15 s | three taps, then a ramp |
@@ -127,6 +128,64 @@ stop or start a service or zygote, run a session script, enter another namespace
 check's picture stays on the phone: in `<stage>/checks` and, for the details view, in the app's cache; Share sends
 text only.
 
+## Session logs
+
+iOS 27 (OneiOS) → **Session logs** (`OneiosLogsActivity`, `OneiosLogActivity`, `OneiosLogsJob`): what the iOS
+sessions left in the stage, read as root after the return. **Not run on the phone yet.**
+
+- **Sessions**: *Last session* (or *This session (still open)*) is `session/xnuhost.log`; up to five *Earlier
+  session* rows are `logs/xnuhost-<epoch>.log`, newest first. Each row has the time of the log's last line, its
+  size, and how it ended, read from its last 40 lines (`exit 4 · kernel panic`, `exit 0 · stopped by SIGTERM`; with
+  no end line, the log's last line).
+- **The switch, the return and the helpers**: `switch.log`, `return.log` (the return's steps, the watcher's and the
+  key readers' lines), `control/display.log`, `control/watchdog_feeder.log`, each when it exists.
+- **A row opens the log.** Its last 256 KiB are read and shown first, scrolled to the end; earlier chunks of 1 MiB
+  follow by themselves until 4 MiB are read or the log is whole, and *Load earlier lines* above the first line reads
+  4 MiB more (the viewer holds 250,000 lines at most). The search field and the chips **E** (xnuhost's error
+  lines), **!!** (lines from signal context), **panic** (the word by itself, not `-no_slto_panic` of the boot
+  arguments) and **guest** (the kernel's console) narrow what is shown: chips add up, the search narrows further.
+  A long press copies a line. **Copy** takes the lines shown, with the summary first (the last 200,000
+  characters). **Share** reads the whole log again and hands it over as a file, the summary in the message's text.
+- **Share all as a zip**: every listed log, whole (a log past 32 MiB keeps its last 32 MiB and says so), at its
+  path in the stage, plus `summary.txt` with the app, the phone, and each session's summary. The files are made
+  under `files/logs/oneios-session`, which the app's file provider serves to the app chosen in the share sheet.
+- **What is shared here is the log as it is on the phone**, not redacted: an xnuhost log is the kernel's console
+  and xnuhost's own lines. *Collect logs* (Last session) is the way that removes personal data; from 0.4.76 it
+  takes these files too (below).
+
+**The summary** above an xnuhost log (`OneiosLogs.summarize`, `core/model`):
+
+| Line | From |
+|---|---|
+| Boot got to | the furthest of nine stages seen, in this order: `xnuhost I xnuhost: session ABI` (xnuhost started); `xnuhost I cpu0: entering the kernel at`; the console's `Darwin Kernel Version` (kernel start); `BSD root: ` (root mount); `load_init_program: attempting to load` (launchd loading); the first `com.apple.xpc.launchd\|` line (launchd running); the first console line with `backboardd[`; the first with `SpringBoard[` or `crashed: SpringBoard.`; `xnuhost I guest ready: first frame` (xnuhost writes `session/ready` with it). A stage before the furthest that was never seen is named |
+| Kernel panic | the text after `panic(cpu N caller 0x...): ` of the console, the first of the last boot that panicked |
+| Processes that died | the console's `sheng-exit: NAME[PID] status 0x.. reason ns .. code 0x..` (the signal is the status's low 7 bits), `Process[PID] crashed: NAME.` and `[NAME: killed] exiting with signal N`, counted once per process: by name, with the count and the signals |
+| Ended | xnuhost's `stopping: WHY (reason R, code C)` (`signal 15` is the return's SIGTERM; `the guest halted on cpuN` with reason 2 a panic, 0 a shutdown, 3 a return asked by the guest; `PSCI SYSTEM_OFF`; `kernel fault`), its `exit N` with the meaning of OneiOS's exit code table, `xnuhost !! fault inside a host call` or `fault on a host thread` (a crash of xnuhost itself, with the signal), a log that ends before the kernel was entered (setup; the last error line), or no end line at all (killed, a restart of the phone, or still running). Then, from `return.log`, the return that started within two minutes of the log's last line: who started it (the watcher with its reason such as `return asked (keys: Volume Up + Volume Down down for 3 s ...)`, `xnuhost N ended`, `the guest did not report ready within 600s`; the app; the key readers; by hand) and how it came out (`One UI restored in place`, `FAILSAFE: ...`) |
+| Counts | lines, xnuhost error lines, lines from signal context, in-place restarts of the guest; and a note while only the end of the log has been read |
+
+The markers are the lines xnuhost's sources print (`runtime/xnuhost/src/main.c`, `log.c`, `cpu.c` in OneiOS, its
+`docs/booter.md`) and the lines the kernel printed in OneiOS's boots on the PC (`logs/fb-boot.log`,
+`logs/keystore-boot*.log`); OneiOS's `oneos/interface.md` section 8 lists them as what the fork reads. The
+`backboardd` and `SpringBoard` stages go by the first console line that names the process with its pid, which is
+what those logs have; a boot whose console never names them is shown as stopping at launchd.
+
+How it is read. `oneios_root.sh logs` prints, for each log that exists, `@@RESULT log <id> <bytes> <mtime>` and its
+last 40 lines (each cut at 400 characters) as `| <id> <line>`; ids are `session`, `xnuhost-<epoch>` (the five
+newest), `switch`, `return`, `display`, `feeder`. `logfile <id> <end> <bytes>` prints `@@RESULT chunk <id> <size>
+<start> <end>` and the bytes `[start, end)` as `| <line>`: at most 1 MiB a call, `end` 0 being the file's end, and
+whole lines only (a chunk that does not start the file starts after its first line break, and the next call ends
+there). Both verbs **only read**: no file is made, changed or moved, each read of a file runs under `timeout 20`,
+and the app ends a root command that has not answered in 45 s. `session/` is the guest's to write, so a log is
+read only when it is a plain file with one name in a folder that is no link. The launcher runs only this build's
+root script: on a stage that holds an earlier build's, the screen's first read runs `status` once, which puts this
+build's script there.
+
+**Collect logs** (`assets/logs/collect.list`, entry `logs.oneios`, from 0.4.76): the same files (and
+`return.outcome`) from `/data/local/tmp/oneios` go into the bundle's `oneios/` folder, through the same runner,
+the same read-only audit (`ProbeAudit`) and the same redaction as every other entry (the Wi-Fi and Bluetooth
+names learned first, the masks of `Redactor`). A file past 64 MiB is skipped with a note, as for every `files`
+entry.
+
 ## Stage
 
 `/data/local/tmp/oneios`, root:root, mode 0700. It is not the Android guests' stage (`/data/local/tmp/oneos`),
@@ -141,9 +200,9 @@ and neither kind of session starts while the other's stage has anything mounted.
 | `data/` | iOS's own writable state. A new runtime or image keeps it; Remove deletes it |
 | `session/` | what xnuhost and the switch share in the running or last session: `xnuhost.log`, `xnuhost.pid`, `ready`, `return.request`, `display.sock`, `tmp/` |
 | `control/` | the way back's own: the session's state, the baseline, xnuhost's pid and namespace as the switch recorded them, the watcher's and key readers' pids, the return's lock and guard. Read-only in xnuhost's namespace, like the two session scripts and `bin/` |
-| `logs/` | the last five sessions' xnuhost logs |
+| `logs/` | the five sessions before the last: `xnuhost-<epoch>.log`, moved there by the next switch (the epoch is that switch's time; the file's own time is its session's last line) |
 | `checks/` | the hardware checks' own: each check's last output (`<id>.log`), the camera pictures (`camera.png`, `camera-hal.png`), the values to put back (`saved.backlight`, `saved.als`), the tools' temporary files |
-| `switch.log`, `return.log`, `return.outcome` | the switch's and the return's own output; how the last return ended |
+| `switch.log`, `return.log`, `return.outcome` | the switch's output; the return's, the watcher's and the key readers'; how the last return ended. `control/display.log` and `control/watchdog_feeder.log` are the display helper's and the watchdog feeder's |
 
 ## Session flow
 
@@ -305,6 +364,16 @@ the two meet at the return's lock.
   tool is ended at the limit, also one that ignores SIGTERM, and the backlight and the sensor are put back**;
   `uncheck` alone puts back once and takes only plain names and numbers from its saved files; the guards on the
   script's text. Not covered by any test: the screen itself, and every tool on the phone.
+- **Session logs.** `core/model` `OneiosLogsTest`: the summary of a boot that panics after SpringBoard, of an early
+  panic, of a ready session ended by the return's SIGTERM with the watcher's reason from `return.log`; every way a
+  session ends; a guest restart in place; the chips and the search; root's list and chunk lines; the returns in
+  `return.log` and which one belongs to a log. `OneiosScriptTest`: `logs` lists this session's log, the five newest
+  earlier ones and the others with sizes, times and last lines; a 6,000-line log read back in chunks of whole
+  lines is the file; a last line with no line break; the 1 MiB limit and the ids, in the launcher and in the script
+  itself; a symlink, a hard link or a linked folder in place of a log is never read; nothing in the stage changes;
+  the two verbs' text has no write and a time limit on every read; the return's own log, written by the real
+  scripts on the fake phone, gives the summary's "Return:" line. `ReadOnlyListsTest`: `logs.oneios` passes the
+  read-only audit and names only the log files. Not covered by any test: the two screens.
 - `./gradlew :core:model:test :core:root:testDebugUnitTest`. The app itself needs the SESL9 libraries from
   GitHub Packages (a token in `~/.config/twidget/github.properties`), as before this change.
 
@@ -331,6 +400,9 @@ debug build too: Android guests that already hold upstream's release-signed one 
 
 ## Not done yet
 
+- **Session logs have not run on the phone.** The two screens were compiled, never opened on a device; the root
+  verbs and the parser ran under bash and mksh on the PC against fake stages and OneiOS's PC boot logs. A phone
+  session's log may have lines the PC's never had: the summary names only what it finds.
 - **Hardware checks have not run on the phone.** Unknown until they do: whether KernelSU's `su` from the app gives
   the tools what adb's root shell gives them (SELinux context, mount namespace); whether `displayctl`'s helper
   starts from the stage (`app_process` with a dex under `/data/local/tmp/oneios/runtime/lib`); whether `pkill -f`

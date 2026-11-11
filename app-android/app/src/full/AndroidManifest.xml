@@ -38,6 +38,18 @@
             android:exported="false"
             android:label="@string/oneios_checks"
             android:parentActivityName=".ui.OneiosActivity" />
+        <!-- Session logs of the iOS system: xnuhost's, the switch's and the return's, read as root (read only). -->
+        <activity
+            android:name=".ui.OneiosLogsActivity"
+            android:exported="false"
+            android:label="@string/oneios_logs"
+            android:parentActivityName=".ui.OneiosActivity" />
+        <activity
+            android:name=".ui.OneiosLogActivity"
+            android:exported="false"
+            android:label="@string/oneios_logs"
+            android:windowSoftInputMode="adjustResize|stateHidden"
+            android:parentActivityName=".ui.OneiosLogsActivity" />
         <activity android:name=".ui.EnvironmentActivity" android:exported="false" />
         <activity android:name=".ui.BootProgressActivity" android:exported="false" />
         <activity android:name=".ui.DebugSettingsActivity" android:exported="false" />

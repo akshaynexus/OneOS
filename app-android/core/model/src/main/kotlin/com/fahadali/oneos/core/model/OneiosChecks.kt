@@ -42,7 +42,7 @@ object OneiosChecks {
 
     val ALL: List<OneiosCheck> = listOf(
         OneiosCheck("cpu", "CPU layout", "bridgectl", "cpu", 15),
-        OneiosCheck("gpu", "GPU", "gpuctl", "", 30),
+        OneiosCheck("gpu", "GPU", "gpuctl", "", 120),
         OneiosCheck(
             "display", "Display layer", "displayctl", "test", 30,
             "Colour bars with a moving white square cover the whole screen for 5 seconds, then One UI is back.",

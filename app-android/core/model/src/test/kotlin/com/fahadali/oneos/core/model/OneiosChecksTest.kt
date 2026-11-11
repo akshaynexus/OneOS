@@ -38,7 +38,9 @@ class OneiosChecksTest {
         assertTrue(check("camera-hal").experimental && check("camera-hal-list").experimental)
         assertTrue(OneiosChecks.RUN_ALL.none { it.experimental })
         // Every check has a time limit, and what the owner has to know is said for the ones that show, sound or need something.
-        assertTrue(OneiosChecks.ALL.all { it.limitSeconds in 5..60 })
+        assertTrue(OneiosChecks.ALL.all { it.limitSeconds in 5..120 })
+        // gpuctl with no argument runs all its steps (nodes, routes, probe, submit, large) from runtime 0.1.5.
+        assertEquals(120, check("gpu").limitSeconds)
         for (id in listOf("display", "haptic", "haptic-pattern", "audio", "bt", "levels", "als", "camera", "camera-hal")) assertNotNull(id, check(id).notice)
         assertTrue(check("bt").notice!!.contains("Bluetooth has to be off"))
         assertTrue(check("levels").notice!!.contains("Adaptive brightness has to be off"))

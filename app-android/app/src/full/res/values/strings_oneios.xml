@@ -37,6 +37,37 @@
     <string name="oneios_stop">Stop</string>
     <string name="oneios_not_this_phone">iOS 27 (OneiOS) is for the Galaxy S24 Ultra (SM-S928) only.</string>
     <string name="oneios_switch_confirm">One UI stops and iOS 27 starts. Hold Volume Up + Volume Down for 3 seconds to come back; if the screen stays black for long, One UI returns by itself, by a restart at worst.</string>
+    <!-- Session logs (docs/oneios.md): what the iOS sessions left in the stage, read as root. -->
+    <string name="oneios_logs">Session logs</string>
+    <string name="oneios_logs_line">Read what the last iOS sessions logged: how far the boot got, a kernel panic, processes that died, how the session ended</string>
+    <string name="oneios_logs_about">What xnuhost, the switch and the return wrote during the last iOS sessions. Root only reads them. A log shared from here is the log as it is on the phone; Collect logs in Last session is the way that removes personal data.</string>
+    <string name="oneios_logs_none">No iOS session has logged anything yet</string>
+    <string name="oneios_logs_none_line">A session\'s log appears here after the first switch to iOS 27.</string>
+    <string name="oneios_logs_no_stage">OneiOS is not set up on this phone, so there are no session logs.</string>
+    <string name="oneios_logs_sessions">Sessions</string>
+    <string name="oneios_logs_current">This session (still open)</string>
+    <string name="oneios_logs_last">Last session</string>
+    <string name="oneios_logs_earlier">Earlier session</string>
+    <string name="oneios_logs_others">The switch, the return and the helpers</string>
+    <string name="oneios_logs_switch">Switch (switch.log)</string>
+    <string name="oneios_logs_return">Return and watcher (return.log)</string>
+    <string name="oneios_logs_display">Display helper (display.log)</string>
+    <string name="oneios_logs_feeder">Watchdog feeder (watchdog_feeder.log)</string>
+    <string name="oneios_logs_row">%1$s · %2$s · %3$s</string>
+    <string name="oneios_logs_share_all">Share all as a zip</string>
+    <string name="oneios_logs_share_all_line">Every log above, whole, with a summary of each session</string>
+    <string name="oneios_logs_refresh">Read again</string>
+    <string name="oneios_logs_stop_share">Stop</string>
+    <string name="oneios_logs_search">Search this log</string>
+    <string name="oneios_logs_loading">Reading…</string>
+    <string name="oneios_logs_status_all">%1$d lines, the whole log (%2$s)</string>
+    <string name="oneios_logs_status_part">%1$d lines, the last %2$s of %3$s</string>
+    <string name="oneios_logs_status_shown">%1$d of %2$d lines shown</string>
+    <string name="oneios_logs_earlier_lines">Load earlier lines</string>
+    <string name="oneios_logs_copied_part">Copied the last 200,000 characters. Share has the whole log.</string>
+    <string name="oneios_logs_line_copied">Line copied</string>
+    <string name="oneios_logs_share_failed">Could not make the file: %1$s</string>
+    <string name="oneios_logs_empty">Nothing in this log matches.</string>
     <!-- Hardware checks (docs/oneios.md): OneiOS's phone tools, run beside One UI. -->
     <string name="oneios_checks">Hardware checks</string>
     <string name="oneios_checks_line">Try the CPU, GPU, display, haptics, audio, Bluetooth, brightness, light sensor and camera parts of OneiOS while One UI runs</string>
@@ -54,7 +85,7 @@
     <string name="oneios_checks_experimental">Experimental, not part of Run all</string>
     <string name="oneios_checks_run">Run</string>
     <string name="oneios_checks_run_all">Run all</string>
-    <string name="oneios_checks_run_all_intro">The checks run one after another, about two minutes in all. Keep the phone in your hand:</string>
+    <string name="oneios_checks_run_all_intro">The checks run one after another, a few minutes in all. Keep the phone in your hand:</string>
     <string name="oneios_checks_will_skip">Skipped as the phone is now:</string>
     <string name="oneios_checks_bt_on">Bluetooth is on in One UI. Turn it off, then run this check.</string>
     <string name="oneios_checks_adaptive_on">Adaptive brightness is on in One UI. Turn it off, then run this check.</string>

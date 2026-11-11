@@ -3,6 +3,8 @@ package com.fahadali.oneos.core.root
 import com.fahadali.oneos.core.model.Hashes
 import com.fahadali.oneos.core.model.OneiosCheckOutcome
 import com.fahadali.oneos.core.model.OneiosChecks
+import com.fahadali.oneos.core.model.OneiosEndKind
+import com.fahadali.oneos.core.model.OneiosLogs
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1243,6 +1245,237 @@ class OneiosScriptTest {
         backlight.writeText("44\n")
         assertOk(f.verb(OneiosRoot.Verb.UNCHECK, listOf("levels")))
         assertEquals("44", backlight.readText().trim())
+    }
+
+    // --- Session logs: the two read-only verbs ------------------------------------------
+
+    private fun logList(f: Fake): OneiosLogs.Listing {
+        val o = f.verb(OneiosRoot.Verb.LOGS)
+        assertOk(o)
+        assertEquals("logs", o.reply.ok)
+        return OneiosLogs.parseList(o.reply.results, o.text.lines())
+    }
+
+    private fun logChunk(f: Fake, id: String, end: Long = 0, bytes: Int = OneiosLogs.CHUNK_MAX): OneiosLogs.Chunk {
+        val o = f.verb(OneiosRoot.Verb.LOGFILE, listOf(id, end.toString(), bytes.toString()))
+        assertOk(o)
+        return OneiosLogs.parseChunk(id, o.reply.results, o.text.lines())!!
+    }
+
+    /** The script run by itself, past the launcher: for the arguments the launcher never carries. */
+    private fun direct(f: Fake, vararg args: String): Fake.Out {
+        val pb = ProcessBuilder(f.sh, File(f.stage, "bin/oneios_root.sh").path, *args).redirectErrorStream(true)
+        pb.environment()["ONEIOS_TEST_ROOT"] = f.root.path
+        val p = pb.start()
+        p.outputStream.close()
+        val text = p.inputStream.readBytes().toString(Charsets.UTF_8)
+        return f.Out(p.waitFor(), text)
+    }
+
+    /** Every file under the stage: its kind, size, time and mode. */
+    private fun snapshot(f: Fake): Map<String, String> = f.stage.walkTopDown().associate { file ->
+        val a = Files.readAttributes(file.toPath(), "unix:mode,size,lastModifiedTime,nlink", java.nio.file.LinkOption.NOFOLLOW_LINKS)
+        file.relativeTo(f.stage).path to "${a["mode"]} ${if (file.isDirectory) 0 else a["size"]} ${a["lastModifiedTime"]} ${a["nlink"]}"
+    }
+
+    private fun xnuhostLog(lines: Int, exit: Int) = buildString {
+        append("[     5.000] xnuhost I xnuhost: session ABI 1, mode takeover, pid 5000\n")
+        append("[     5.100] xnuhost I cpu0: entering the kernel at 0x2003dcc488\n")
+        append("[     5.200] guest     Darwin Kernel Version 25.5.0: Wed Nov 11 04:04:41 IST 2026; akshay:ios-obj/DEVELOPMENT_ARM64_BCM2837\n")
+        for (i in 1..lines) append("[%6d.%03d] guest     line %d of the kernel's console: %s\n".format(5 + i / 1000, i % 1000, i, "x".repeat(i % 97)))
+        append("[   900.000] guest     panic(cpu 1 caller 0xfffffff00ad8d2c4): Console I/O from interrupt-disabled context @serial_console.c:175\n")
+        append("[   900.100] xnuhost I stopping: the guest halted on cpu1 (reason 2, code 0)\n")
+        append("[   900.200] xnuhost I exit $exit\n")
+    }
+
+    @Test
+    fun theLogVerbsListTheSessionLogsAndReadThemInWholeLines() = each { f ->
+        assertRefused(f.verb(OneiosRoot.Verb.LOGS), "not in the stage")
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("runtime")))
+        // A stage no session ran in: nothing to list, and no log to read.
+        assertEquals(emptyList<String>(), logList(f).files.map { it.id })
+        assertRefused(f.verb(OneiosRoot.Verb.LOGFILE, listOf("session", "0", "1000")), "no such log")
+
+        for (d in listOf("session", "logs", "control")) File(f.stage, d).mkdirs()
+        val session = xnuhostLog(6000, 4)
+        File(f.stage, "session/xnuhost.log").writeText(session)
+        // Seven earlier logs: the five newest are listed.
+        for (i in 1..7) File(f.stage, "logs/xnuhost-170000000$i.log").writeText(xnuhostLog(i, 0))
+        File(f.stage, "logs/notes.txt").writeText("not a log\n")
+        File(f.stage, "switch.log").writeText("=== OneOS app switch 2026-11-11 10:00:00 epoch 1794300000 versionCode 100 ===\n=== ONEIOS SESSION LAUNCHED ===\n")
+        // No line break at its end, a line longer than a list row, and bytes that are no UTF-8.
+        File(f.stage, "return.log").writeBytes("10:15:02 === Return to One UI (app), session state 'running', boot b ===\n".toByteArray() +
+            ("y".repeat(900) + "\n").toByteArray() + byteArrayOf(0xff.toByte(), 0xfe.toByte(), '\n'.code.toByte()) + "10:15:40 One UI restored in place (Enforcing).".toByteArray())
+        File(f.stage, "control/display.log").writeText("oneios-display: connected\n")
+        val before = snapshot(f)
+
+        val list = logList(f)
+        assertFalse(list.sessionOpen)
+        assertEquals(listOf("session") + (7 downTo 3).map { "xnuhost-170000000$it" } + listOf("switch", "return", "display"), list.files.map { it.id })
+        val row = list.files.first()
+        assertEquals(session.length.toLong(), row.bytes)
+        assertEquals(File(f.stage, "session/xnuhost.log").lastModified() / 1000, row.modified)
+        // Its last 40 lines, whole: the end of the session is read from them.
+        assertEquals(session.lines().dropLast(1).takeLast(40), row.tail)
+        assertEquals("exit 4 · kernel panic", OneiosLogs.endLine(row.tail))
+        assertEquals("exit 0 · kernel panic", OneiosLogs.endLine(list.files[1].tail))
+        val ret = list.files.first { it.id == "return" }
+        assertEquals(4, ret.tail.size)
+        assertEquals(400, ret.tail[1].length)
+        assertEquals("10:15:40 One UI restored in place (Enforcing).", ret.tail.last())
+
+        // The end first, then earlier chunks, each of whole lines, each ending where the one after it starts.
+        val parts = ArrayList<List<String>>()
+        var end = 0L
+        for (n in 0 until 200) {
+            val c = logChunk(f, "session", end, 65_536)
+            assertEquals(session.length.toLong(), c.size)
+            if (end != 0L) assertEquals(end, c.end)
+            assertTrue(c.end - c.start in 1..65_536)
+            parts += c.lines
+            end = c.start
+            if (c.first) break
+        }
+        assertTrue(parts.size in 5..20)
+        assertEquals(session.lines().dropLast(1), parts.reversed().flatten())
+        assertTrue(parts.first().last() == "[   900.200] xnuhost I exit 4")
+        val whole = OneiosLogs.summarize(parts.reversed().flatten())
+        assertEquals(OneiosEndKind.PANIC, whole.end.kind)
+        assertEquals(6006, whole.lines)
+
+        // A small log is one chunk; a last line with no line break still ends before root's own answer.
+        val small = logChunk(f, "return")
+        assertTrue(small.first)
+        assertEquals(4, small.lines.size)
+        assertEquals(900, small.lines[1].length)
+        assertEquals("10:15:40 One UI restored in place (Enforcing).", small.lines.last())
+        assertEquals(listOf("oneios-display: connected"), logChunk(f, "display").lines)
+        assertEquals(xnuhostLog(7, 0).lines().dropLast(1), logChunk(f, "xnuhost-1700000007").lines)
+        // An end past the file is the file's end; an older log that is not there is refused.
+        assertEquals(small.lines, logChunk(f, "return", 999_999).lines)
+        assertRefused(f.verb(OneiosRoot.Verb.LOGFILE, listOf("xnuhost-1600000000", "0", "1000")), "no such log")
+        assertRefused(f.verb(OneiosRoot.Verb.LOGFILE, listOf("feeder", "0", "1000")), "no such log")
+
+        // Nothing in the stage was made, changed, moved or touched.
+        assertEquals(before, snapshot(f))
+    }
+
+    @Test
+    fun theLogVerbsTakeOnlyTheirOwnIdsAndAtMostOneMebibyte() = each { f ->
+        fun bad(vararg args: String) = assertTrue(args.toList().toString(), OneiosRoot.problems(OneiosRoot.Verb.LOGFILE, args.toList()).isNotEmpty())
+        assertEquals(emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.LOGS, emptyList()))
+        assertEquals(emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.LOGFILE, listOf("session", "0", "1048576")))
+        assertEquals(emptyList<String>(), OneiosRoot.problems(OneiosRoot.Verb.LOGFILE, listOf("xnuhost-1794300000", "4096", "1")))
+        assertTrue(OneiosRoot.problems(OneiosRoot.Verb.LOGS, listOf("session")).isNotEmpty())
+        bad("session", "0", "1048577"); bad("session", "0", "0"); bad("session", "-1", "10"); bad("session", "0")
+        bad("xnuhost.log", "0", "10"); bad("../switch", "0", "10"); bad("control/state", "0", "10"); bad("checks", "0", "10"); bad("xnuhost-1a", "0", "10")
+        // The script refuses the same by itself.
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("runtime")))
+        File(f.stage, "session").mkdirs()
+        File(f.stage, "session/xnuhost.log").writeText("a\n")
+        File(f.stage, "runtime.conf").writeText("version=0.1.0\n")
+        for (args in listOf(
+            listOf("logfile", "session", "0", "1048577"), listOf("logfile", "session", "0", "0"), listOf("logfile", "session", "x", "10"),
+            listOf("logfile", "runtime.conf", "0", "10"), listOf("logfile", "../session/xnuhost", "0", "10"), listOf("logfile", "xnuhost-", "0", "10"),
+            listOf("logfile", "xnuhost-1/../../runtime.conf", "0", "10"), listOf("logfile", "session"), listOf("logs", "session"),
+        )) {
+            val o = direct(f, *args.toTypedArray())
+            assertEquals(args.toString() + o.text, 3, o.exit)
+            assertTrue(o.text, o.reply.refused != null && !o.text.contains("version="))
+        }
+        assertEquals(listOf("a"), OneiosLogs.parseChunk("session", direct(f, "logfile", "session", "0", "1048576").let { it.reply.results }, listOf("| a"))!!.lines)
+    }
+
+    /** session/ is the guest's to write: a link left there, or a second name for a file, is never read. */
+    @Test
+    fun aLinkInPlaceOfALogIsNotRead() = each { f ->
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("runtime")))
+        val secret = File(f.root, "data/system-secret").apply { writeText("ONE-UI-SECRET\n") }
+        for (d in listOf("session", "logs")) File(f.stage, d).mkdirs()
+        Files.createSymbolicLink(File(f.stage, "session/xnuhost.log").toPath(), secret.toPath())
+        Files.createLink(File(f.stage, "logs/xnuhost-1700000001.log").toPath(), secret.toPath())
+        Files.createSymbolicLink(File(f.stage, "control").toPath(), File(f.root, "data").toPath())
+        File(f.root, "data/display.log").writeText("ONE-UI-SECRET\n")
+        val o = f.verb(OneiosRoot.Verb.LOGS)
+        assertOk(o)
+        assertFalse(o.text, o.text.contains("ONE-UI-SECRET"))
+        assertEquals(emptyList<String>(), OneiosLogs.parseList(o.reply.results, o.text.lines()).files.map { it.id })
+        for (id in listOf("session", "xnuhost-1700000001", "display")) {
+            val c = f.verb(OneiosRoot.Verb.LOGFILE, listOf(id, "0", "1000"))
+            assertRefused(c, "no such log")
+            assertFalse(c.text, c.text.contains("ONE-UI-SECRET"))
+        }
+        // logs/ itself as a link: nothing of where it points is listed.
+        File(f.stage, "logs").deleteRecursively()
+        File(f.root, "data/elsewhere").mkdirs()
+        File(f.root, "data/elsewhere/xnuhost-1700000002.log").writeText("ONE-UI-SECRET\n")
+        Files.createSymbolicLink(File(f.stage, "logs").toPath(), File(f.root, "data/elsewhere").toPath())
+        assertFalse(f.verb(OneiosRoot.Verb.LOGS).text.contains("xnuhost-1700000002"))
+        assertRefused(f.verb(OneiosRoot.Verb.LOGFILE, listOf("xnuhost-1700000002", "0", "1000")), "no such log")
+    }
+
+    /** The two verbs write nothing: no redirection but to /dev/null, and no command that makes, changes or removes a file. */
+    @Test
+    fun theLogVerbsOnlyRead() {
+        val lines = code(rootScript)
+        val from = lines.indexOfFirst { it.startsWith("LOG_CHUNK_MAX=") }
+        val to = lines.indexOfFirst { it.contains("refuse \"not root\"") }
+        assertTrue(from in 1 until to)
+        val logs = lines.subList(from, to).joinToString("\n") { it.replace(Regex(""" # .*$"""), "") }
+        assertTrue(logs.contains("do_logs()") && logs.contains("do_logfile()"))
+        val writes = Regex("""(?<![0-9&])>>?\s*("?[^\s;&|)]+)""").findAll(logs).map { it.groupValues[1].trim('"') }
+            .filterNot { it.isEmpty() || it == "/dev/null" || it.startsWith("&") }.toSet()
+        assertEquals(emptySet<String>(), writes)
+        assertFalse(Regex("""[^2]>\s*/dev/null""").containsMatchIn(logs.replace("2>/dev/null", "")))
+        val words = Regex("""[A-Za-z_][A-Za-z0-9_.-]*""").findAll(logs).map { it.value }.toSet()
+        for (never in listOf("rm", "mv", "cp", "mkdir", "rmdir", "unlink", "touch", "chmod", "chown", "tee", "dd", "truncate", "ln", "setprop", "kill", "pkill",
+            "nsenter", "sh", "eval", "exec", "own", "take", "base64")) {
+            assertFalse("the log verbs use '$never'", never in words)
+        }
+        // A time limit on every read of a file, one mebibyte a call, and the plain-file test before each.
+        assertEquals(Regex("""tail -c""").findAll(logs).count(), Regex("""timeout "\${'$'}LOG_READ_LIMIT" tail -c""").findAll(logs).count())
+        assertTrue(logs.contains("LOG_CHUNK_MAX=${OneiosLogs.CHUNK_MAX}\n"))
+        assertTrue(logs.contains("log_plain \"\$F\" || return 0") && logs.contains("log_plain \"\$F\" || refuse"))
+        assertTrue(logs.contains("for id in switch return display feeder; do"))
+        assertEquals(OneiosLogs.OTHERS, listOf("switch", "return", "display", "feeder"))
+        // The app's paths are the script's.
+        val text = rootScript.readText()
+        for (id in listOf("session") + OneiosLogs.OTHERS) assertTrue(id, text.contains("        $id) F=\"\$STAGE/${OneiosLogs.path(id)}\" ;;\n"))
+        assertTrue(text.contains("F=\"\$STAGE/logs/\$1.log\" ;;"))
+        assertEquals("logs/xnuhost-17.log", OneiosLogs.path("xnuhost-17"))
+        // And the switch keeps its logs where they are read: this session's, and the five before.
+        val sw = switchScript.readText()
+        assertTrue(sw.contains("mv -f \"\$SESSION/xnuhost.log\" \"\$STAGE/logs/xnuhost-\$(date +%s).log\""))
+        assertTrue(sw.contains("ls -1t \"\$STAGE/logs\"/xnuhost-*.log 2>/dev/null | tail -n +6"))
+        assertTrue(sw.contains(">>\"\$SESSION/xnuhost.log\" 2>&1 &") && sw.contains(">>\"\$CTL/display.log\" 2>&1 &") && sw.contains("L=\"\$CTL/watchdog_feeder.log\""))
+        assertTrue(text.contains(">>\"\$STAGE/switch.log\"") && text.contains(">>\"\$STAGE/return.log\""))
+    }
+
+    /** What the return and the watcher write to return.log is what the summary's "Return:" reads. */
+    @Test
+    fun theReturnsLogSaysWhoReturnedAndHow() = each { f ->
+        f.phone()
+        File(f.session, "ready").createNewFile()
+        val w = watcher(f)
+        File(f.session, "return.request").writeText("keys: Volume Up + Volume Down down for 3 s at 2026-11-11 10:15:01\n")
+        assertTrue(w.waitFor(60, TimeUnit.SECONDS))
+        f.assertInPlace()
+        val notes = OneiosLogs.returns(f.returnLog.lines())
+        assertEquals(f.returnLog, 1, notes.size)
+        val n = notes.single()
+        assertEquals("watcher", n.who)
+        assertTrue(n.keys)
+        assertEquals("return asked (keys: Volume Up + Volume Down down for 3 s at 2026-11-11 10:15:01)", n.why)
+        assertEquals("One UI restored in place (Enforcing).", n.result)
+        assertTrue(Regex("""\d{4}-\d\d-\d\d""").matches(n.date!!))
+        // Read through root, as the app does.
+        val chunk = logChunk(f, "return")
+        assertEquals(notes, OneiosLogs.returns(chunk.lines))
+        // A return asked again with nothing open does nothing, and is not counted as a return.
+        val again = f.returns("app")
+        assertEquals(again.text, 0, again.exit)
+        assertTrue(f.returnLog, f.returnLog.contains("=== Return to One UI (app), session state 'returned'"))
+        assertEquals(notes, OneiosLogs.returns(f.returnLog.lines()))
     }
 
     private companion object {

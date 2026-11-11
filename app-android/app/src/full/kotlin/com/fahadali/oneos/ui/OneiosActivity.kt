@@ -150,8 +150,13 @@ class OneiosActivity : EdgeToEdgeActivity() {
         }
 
         // Hardware checks: OneiOS's phone tools beside One UI, a screen of its own.
-        PrebootCards.row(PrebootCards.section(list), getString(R.string.oneios_checks), getString(R.string.oneios_checks_line), chevron = true) {
+        val tools = PrebootCards.section(list)
+        PrebootCards.row(tools, getString(R.string.oneios_checks), getString(R.string.oneios_checks_line), chevron = true) {
             startActivity(OneiosChecksActivity.intent(this))
+        }
+        // Session logs: what the last iOS sessions logged, read as root (read only).
+        PrebootCards.row(tools, getString(R.string.oneios_logs), getString(R.string.oneios_logs_line), chevron = true) {
+            startActivity(OneiosLogsActivity.intent(this))
         }
 
         // The experimental tick: asked every time, as for a phone a system was never tested on.

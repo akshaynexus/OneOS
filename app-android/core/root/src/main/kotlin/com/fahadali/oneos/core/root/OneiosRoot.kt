@@ -2,6 +2,7 @@ package com.fahadali.oneos.core.root
 
 import com.fahadali.oneos.core.model.OneiosChecks
 import com.fahadali.oneos.core.model.OneiosKind
+import com.fahadali.oneos.core.model.OneiosLogs
 import com.fahadali.oneos.core.model.OneiosManifests
 import com.fahadali.oneos.core.model.OneiosSystem
 
@@ -44,6 +45,12 @@ object OneiosRoot {
 
         /** The picture a camera check wrote, in base64. */
         CHECKFILE("checkfile", Stdin.NONE),
+
+        /** Read only: the session logs in the stage ([OneiosLogs]), each with its size, time and last lines. */
+        LOGS("logs", Stdin.NONE),
+
+        /** Read only: up to 1 MiB of one log, whole lines, ending at a byte offset (0 = the file's end). */
+        LOGFILE("logfile", Stdin.NONE),
     }
 
     /** What the launcher's checks look at: the phone, or a fake root in the tests. */
@@ -78,7 +85,13 @@ object OneiosRoot {
             args.getOrNull(i)?.let { if (!OneiosManifests.validPath(it)) p += "${verb.word}: '${it.take(40)}' is not a plain relative path" }
         }
         when (verb) {
-            Verb.STATUS, Verb.REMOVE, Verb.RETURN -> need(0)
+            Verb.STATUS, Verb.REMOVE, Verb.RETURN, Verb.LOGS -> need(0)
+            Verb.LOGFILE -> {
+                need(3)
+                args.getOrNull(0)?.let { if (!OneiosLogs.validId(it)) p += "logfile: '${it.take(40)}' is not a session log" }
+                arg(1, DEC, "an offset")
+                args.getOrNull(2)?.let { if ((it.toLongOrNull() ?: 0) !in 1..OneiosLogs.CHUNK_MAX) p += "logfile: 1 to ${OneiosLogs.CHUNK_MAX} bytes a call" }
+            }
             Verb.BEGIN -> { need(1); kind(0) }
             Verb.RECEIVE -> {
                 need(5); kind(0); path(1); arg(2, DEC, "a size"); arg(3, HEX64, "a SHA-256")

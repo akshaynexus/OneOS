@@ -37,6 +37,14 @@
 #   uncheck <id>                the put-back step of <id> alone, for a check
 #                               whose root command the app had to end
 #   checkfile <id>              the picture a camera check wrote, in base64
+#   logs                        read only: the session logs in the stage (this
+#                               session's or the last one's xnuhost.log, the
+#                               five earlier ones, the switch's, the return's
+#                               and the helpers'), each with its size, the time
+#                               of its last line and its last lines
+#   logfile <id> <end> <bytes>  read only: up to <bytes> bytes (1 MiB at most)
+#                               of one of them, whole lines, ending at byte
+#                               <end> (0 = the end of the file)
 #
 # Writes: only under $STAGE (/data/local/tmp/oneios), which is root's, mode
 # 0700, and separate from OneOS's Android stage. Nothing of One UI's data, no
@@ -370,7 +378,7 @@ check_cmd() { # <id>: TOOL (a file of the runtime's bin/), ARGS, LIMIT in second
     R="$STAGE/runtime/bin"
     case "$1" in
         cpu) TOOL=bridgectl ARGS="cpu" LIMIT=15 ;;
-        gpu) TOOL=gpuctl ARGS="" LIMIT=30 ;;
+        gpu) TOOL=gpuctl ARGS="" LIMIT=120 ;;
         display) TOOL=displayctl ARGS="test" LIMIT=30 ;;
         haptic) TOOL=bridgectl ARGS="haptic 200 1000" LIMIT=10 ;;
         haptic-pattern) TOOL=bridgectl ARGS="haptic-pattern" LIMIT=15 ;;
@@ -526,6 +534,96 @@ do_checkfile() {
     say "@@OK checkfile $1"
 }
 
+# --- Session logs -------------------------------------------------------------
+# What the last iOS sessions left behind, for the app's Session logs screen
+# (docs/oneios.md). Both verbs only read: no file is made, changed or moved,
+# and they answer during a session too. session/ is the guest's to write, so a
+# log is read only when it is a plain file with one name in a folder that is
+# no link: a link left there would otherwise hand the app a file of One UI's.
+# Sizes and offsets are compared and added with awk (mksh counts in 32 bits).
+LOG_CHUNK_MAX=1048576
+LOG_READ_LIMIT=20
+LOG_TAIL_LINES=40
+log_path() { # <id>: F, that log's file
+    case "$1" in
+        session) F="$STAGE/session/xnuhost.log" ;;
+        switch) F="$STAGE/switch.log" ;;
+        return) F="$STAGE/return.log" ;;
+        display) F="$STAGE/control/display.log" ;;
+        feeder) F="$STAGE/control/watchdog_feeder.log" ;;
+        xnuhost-[0-9]*)
+            is_dec "${1#xnuhost-}" || usage "'$1' is not a session log"
+            F="$STAGE/logs/$1.log" ;;
+        *) usage "'$1' is not a session log" ;;
+    esac
+}
+log_plain() { # <file>
+    [ -d "${1%/*}" ] && [ ! -L "${1%/*}" ] && [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %h "$1" 2>/dev/null)" = 1 ]
+}
+num_le() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'; }
+log_row() { # <id>: its size, the time of its last write, its last lines
+    log_path "$1"
+    log_plain "$F" || return 0
+    size=$(stat -c %s "$F" 2>/dev/null)
+    mtime=$(stat -c %Y "$F" 2>/dev/null)
+    is_dec "$size" && is_dec "$mtime" || return 0
+    say "@@RESULT log $1 $size $mtime"
+    # The end of the file; a first line cut by the 16 KiB is left out.
+    if num_le "$size" 16384; then
+        timeout "$LOG_READ_LIMIT" tail -c 16384 "$F" 2>/dev/null
+    else
+        timeout "$LOG_READ_LIMIT" tail -c 16384 "$F" 2>/dev/null | sed 1d
+    fi | tail -n "$LOG_TAIL_LINES" | cut -c1-400 | awk -v id="$1" '{ print "| " id " " $0 }'
+}
+
+do_logs() {
+    [ $# -eq 0 ] || usage "logs"
+    stage_ok
+    if session_open; then say "@@RESULT session open"; else say "@@RESULT session none"; fi
+    log_row session
+    n=0
+    if [ -d "$STAGE/logs" ] && [ ! -L "$STAGE/logs" ]; then
+        for id in $(ls -1 "$STAGE/logs" 2>/dev/null | sed -n 's/^\(xnuhost-[0-9][0-9]*\)\.log$/\1/p' | sort -r); do
+            [ $n -lt 5 ] || break
+            log_row "$id"
+            n=$((n + 1))
+        done
+    fi
+    for id in switch return display feeder; do log_row "$id"; done
+    say "@@OK logs"
+}
+
+do_logfile() {
+    [ $# -eq 3 ] || usage "logfile takes a log, an end and a size"
+    id=$1 end=$2 max=$3
+    log_path "$id"
+    is_dec "$end" || usage "logfile: end '$end'"
+    is_dec "$max" && num_le 1 "$max" && num_le "$max" "$LOG_CHUNK_MAX" || usage "logfile: 1 to $LOG_CHUNK_MAX bytes a call"
+    stage_ok
+    log_plain "$F" || refuse "there is no such log on this phone"
+    size=$(stat -c %s "$F" 2>/dev/null)
+    is_dec "$size" || die "could not read the size of $id"
+    # The bytes [start, end): end 0, or past the file, is the file's end.
+    set -- $(awk -v s="$size" -v e="$end" -v m="$max" 'BEGIN {
+        if (e + 0 == 0 || s + 0 < e + 0) e = s
+        b = e - m; if (b < 0) b = 0
+        printf "%.0f %.0f %.0f\n", b, e, e - b }')
+    start=$1 end=$2 len=$3
+    # Whole lines only: a chunk that does not start the file starts after its
+    # first line break, and says so in its start (the next call ends there).
+    skip=0
+    if [ "$start" != 0 ] && [ "$len" != 0 ]; then
+        from=$(awk -v a="$start" 'BEGIN { printf "%.0f", a + 1 }')
+        skip=$(timeout "$LOG_READ_LIMIT" tail -c "+$from" "$F" 2>/dev/null | head -c "$len" | head -n 1 | wc -c | tr -d ' ')
+        is_dec "$skip" && [ "$skip" -lt "$len" ] || skip=0
+    fi
+    set -- $(awk -v a="$start" -v k="$skip" -v l="$len" 'BEGIN { printf "%.0f %.0f %.0f\n", a + k, a + k + 1, l - k }')
+    start=$1 from=$2 len=$3
+    say "@@RESULT chunk $id $size $start $end"
+    [ "$len" = 0 ] || timeout "$LOG_READ_LIMIT" tail -c "+$from" "$F" 2>/dev/null | head -c "$len" | awk '{ print "| " $0 }'
+    say "@@OK logfile $id"
+}
+
 [ -n "$T" ] || [ "$(id -u)" = 0 ] || refuse "not root"
 verb=${1:-}
 [ $# -gt 0 ] && shift
@@ -541,5 +639,7 @@ case "$verb" in
     check) do_check "$@" ;;
     uncheck) do_uncheck "$@" ;;
     checkfile) do_checkfile "$@" ;;
-    *) usage "oneios_root.sh status|begin|receive|script|finish|switch|return|remove|check|uncheck|checkfile" ;;
+    logs) do_logs "$@" ;;
+    logfile) do_logfile "$@" ;;
+    *) usage "oneios_root.sh status|begin|receive|script|finish|switch|return|remove|check|uncheck|checkfile|logs|logfile" ;;
 esac
