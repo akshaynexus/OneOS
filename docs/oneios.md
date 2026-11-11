@@ -15,6 +15,11 @@ stop, the watchdog feeder and the in-place return ran, twice to One UI in 45 s. 
 there**, and one return stood still with a black screen; both causes are found and fixed in 0.4.81 ("What the
 first runs on the phone found", below). Everything after xnuhost's start is still unit tests only.
 
+**0.4.86** (115) merges OneOS 0.4.83 to 0.4.85 and the guest wallpaper fix (#133); none of it runs in an iOS
+session. It also clears the same two shell traps from OneOS's own Android scripts (a redirected `:`, `tr` reading
+`/proc` itself), upstream's new ones included, and the reboot's last resorts no longer wait on each other. Not
+yet run on the phone.
+
 ## Where its pieces come from
 
 | Piece | Where from | In git or a release? |

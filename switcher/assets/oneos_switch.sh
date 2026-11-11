@@ -3680,7 +3680,7 @@ if [ "$RETURN_MAX" -gt 0 ]; then
             if [ \"\${hwcarm:-0}\" = 1 ] && [ \$new_failed -gt 30 ] && [ -f $STAGE/data/oneos_hwc ] && [ ! -e $STAGE/data/oneos_hwc_forced ]; then
                 GP=\$(pidof system_server | awk '{print \$1}'); [ -n \"\$GP\" ] || GP=\$(pidof surfaceflinger | awk '{print \$1}')
                 if [ -n \"\$GP\" ]; then
-                    : > $STAGE/data/oneos_hwc_forced
+                    true > $STAGE/data/oneos_hwc_forced
                     echo \"\$(date) composer rejected \$new_failed frames with HW overlays on: GPU composition forced: \$(timeout 10 $BB nsenter -t \$GP -m /system/bin/sh /data/oneos_genv.sh /system/bin/service call SurfaceFlinger 1008 i32 1 2>&1 | tr '\n' ' ')\"
                     new_failed=0
                 fi
