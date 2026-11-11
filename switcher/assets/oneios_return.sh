@@ -97,8 +97,11 @@ do_reboot() { # <reason word>
     sync
     setprop sys.powerctl "reboot,$1"
     sleep 20
-    # init did not reboot: the kernel's reboot, then sysrq as the last resort.
+    # init did not reboot: Android's own reboot, then busybox's (KernelSU's busybox has no reboot applet: then it
+    # only prints that), then sysrq as the last resort.
     sync
+    [ -x "$T/system/bin/reboot" ] && "$T/system/bin/reboot" "$1"
+    sleep 5
     [ -n "$BB" ] && "$BB" reboot -f
     sleep 5
     echo 1 > "$P/sys/kernel/sysrq" 2>/dev/null

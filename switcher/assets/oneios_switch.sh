@@ -156,7 +156,11 @@ hard_reboot() { # <reason word> <why>
     sync
     setprop sys.powerctl "reboot,$1"
     sleep 20
+    # init did not reboot: Android's own reboot, then busybox's (a root manager's busybox may have no reboot
+    # applet: then it only prints that), then sysrq.
     sync
+    [ -x "$T/system/bin/reboot" ] && "$T/system/bin/reboot" "$1"
+    sleep 5
     [ -n "$BB" ] && "$BB" reboot -f
     sleep 5
     echo 1 > "$P/sys/kernel/sysrq" 2>/dev/null
@@ -512,7 +516,9 @@ done
 [ -n "$BB" ] || refuse "no busybox at the root manager's paths (/data/adb/ksu/bin, /data/adb/ap/bin, /data/adb/magisk)"
 APPLETS=" $("$BB" --list 2>/dev/null | tr '\n' ' ') "
 missing=""
-for a in sh mount umount unshare nsenter setsid awk grep sed reboot; do
+# No reboot applet: KernelSU's busybox has none, and oneos_switch.sh asks for none. The way back's reboot is
+# init's (sys.powerctl), then Android's own reboot, then busybox's where it has one, then sysrq (hard_reboot).
+for a in sh mount umount unshare nsenter setsid awk grep sed; do
     case "$APPLETS" in *" $a "*) ;; *) missing="$missing $a" ;; esac
 done
 [ -z "$missing" ] || refuse "$BB lacks the applets:$missing"

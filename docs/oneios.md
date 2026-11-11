@@ -257,8 +257,9 @@ runtime with xnuhost is staged, this is where every switch ends.**
    list starts zygote; `ctl.start zygote` otherwise).
 5. **Gate C.** system_server keeps its pid until user 0 is unlocked and 20 s more, within 180 s.
 
-A failed check anywhere is the failsafe: `sys.powerctl reboot,oneios-inplace-failsafe`, then busybox's
-`reboot -f`, then sysrq. `oneios_return.sh reboot` goes straight there. A return with no open session does
+A failed check anywhere is the failsafe: `sys.powerctl reboot,oneios-inplace-failsafe`, then Android's own
+`reboot`, then busybox's `reboot -f`, then sysrq. Busybox needs no reboot applet: KernelSU's has none, and from
+0.4.77 the switch no longer asks for one (`oneos_switch.sh` never did). `oneios_return.sh reboot` goes straight there. A return with no open session does
 nothing, and a switch that ended before it stopped One UI's zygote (the stop is marked in `control/stopped`)
 only has its helpers ended: neither restarts anything.
 
