@@ -492,9 +492,14 @@ case "$MODE" in
                ONEIOS_DATA=/data/data ONEIOS_SESSION=/data/session TMPDIR=/data/session/tmp
         unset BB ONEIOS_APP ONEIOS_TEST_ROOT
         # A switch that gave up on this shell meanwhile is returning to One
-        # UI: nothing starts under it.
-        [ "$(cat /data/control/state 2>/dev/null)" = starting ] ||
-            die_inner "the switch is no longer starting (state '$(cat /data/control/state 2>/dev/null)'): xnuhost is not started"
+        # UI: nothing starts under it. "running" is not giving up: the outer
+        # switch writes it as soon as it reads the pid this shell wrote above,
+        # which can be before this line (a race the phone hit on 2026-11-11).
+        ST=$(cat /data/control/state 2>/dev/null)
+        case "$ST" in
+            starting|running) ;;
+            *) die_inner "the switch is no longer starting (state '$ST'): xnuhost is not started" ;;
+        esac
         AT="exec of /data/runtime/$R_XNUHOST"
         echo "oneios inner: $(date '+%F %T') starting /data/runtime/$R_XNUHOST (pid $$)"
         exec "/data/runtime/$R_XNUHOST" --session-abi $ABI --mode takeover \
