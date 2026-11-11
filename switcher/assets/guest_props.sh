@@ -261,6 +261,38 @@ add)
             echo "guest_props: $key=$value for this ColorOS session"
         done
     fi
+    # Fold and unfold in ColorOS took 2-3 s to show the other panel (owner,
+    # 11-10, Z Fold8 Ultra; One UI is instant). That session's log: the guest's
+    # thermal status was CRITICAL (its skin estimate 47 C), the framework then
+    # caps rendering at 0-60 Hz and the 120 Hz floor we set drops out; 1-3 ms
+    # after the newly lit panel was powered this SurfaceFlinger chose 1 Hz for
+    # it, SystemUI could not draw its first frame and the display switch sat out
+    # its 2 s sync timeout. Below CRITICAL the range is [120, 120] and the swap
+    # is instant. This image's SurfaceFlinger ranks "Power On Imminent" before
+    # idle and content (read in its binary): while a panel is not on yet, and
+    # for this many ms after its power mode changed, it takes the top of the
+    # allowed range (60 Hz under the cap, 120 otherwise). The timer is made per
+    # display and only when the property is above 0; One UI does not define it.
+    # The thermal cap itself is not touched. Only for the image it was read in.
+    # ONEOS_GUEST_SF_POWER_TIMER=0 leaves it out, another number is that many ms.
+    PT=ro.surface_flinger.set_display_power_timer_ms; PTV=${ONEOS_GUEST_SF_POWER_TIMER:-1000}
+    case "$PTV" in [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]) ;; *) PTV="" ;; esac
+    if [ -n "$PTV" ] && grep -q '"image": "coloros17-findn6"' "$STAGE/.oneos_stage"; then
+        if grep -qxF "$PT" "$HOST"; then
+            hv=$(getprop "$PT")
+            case "$hv" in
+                [1-9]*) echo "guest_props: $PT is One UI's $hv, kept" ;;
+                *) if "$RP" -n "$PT" "$PTV"; then
+                       echo "$PT=$hv" >> "$OVR"
+                       echo "guest_props: $PT overridden to $PTV for this ColorOS session"
+                   fi ;;
+            esac
+        else
+            sed -i '/^ro\.surface_flinger\.set_display_power_timer_ms=/d' "$NEW"
+            echo "$PT=$PTV" >> "$NEW"
+            echo "guest_props: $PT=$PTV for this ColorOS session (a newly lit panel starts at the top of the allowed refresh range)"
+        fi
+    fi
     # One UI's color mode (oneos_switch.sh, host_color_mode), read by the
     # guest's SurfaceFlinger at start: it no longer moves the panels between
     # SRGB and DISPLAY_P3 with what is on screen (Pixel, session 9455098f: a
@@ -292,7 +324,10 @@ add)
             hv=$(getprop "$RR")
             case "$hv" in 1|true) "$RP" -n "$RR" 0 && echo "$RR=$hv" >> "$OVR" &&
                 echo "guest_props: $RR=$hv overridden to 0 for the session (no Adreno: SkiaGL would wait for kgsl forever)" ;; esac
-        elif grep -q "^persist\.sys\.renderengine\.retry=\(1\|true\)$" "$NEW"; then
+        # 0.4.85: -E. This was a basic expression with "\|", which the phone's grep does not take
+        # as "or" (see oneos_switch.sh), so the image's value was never rewritten here: 0 of 625
+        # reports carry the line below.
+        elif grep -qE "^persist\.sys\.renderengine\.retry=(1|true)$" "$NEW"; then
             sed -i "/^persist\.sys\.renderengine\.retry=/d" "$NEW"
             echo "$RR=0" >> "$NEW"
             echo "guest_props: $RR=0 for the session (no Adreno: SkiaGL would wait for kgsl forever)"
@@ -314,12 +349,40 @@ add)
         # retry wait off (above) so can the guest's: the image's choice there. The Xclipse Exynos
         # (S22, S23 FE) and the MediaTek Mali (A34) start with Vulkan and keep it.
         if grep -qxF "$RR" "$HOST"; then rrv=$(getprop "$RR"); else rrv=$(sed -n 's/^persist\.sys\.renderengine\.retry=//p' "$NEW" | tail -n 1); fi
-        case "$(getprop ro.board.platform)" in
-            s5e*|erd*|exynos*)
+        # 0.4.81: this test read ro.board.platform alone ("s5e*"), and the A25 and A33 say
+        # "universal8825" there (s5e8825 is their ro.hardware), so 0.4.74 never came here on
+        # the phones it was written for: every A25/A33 OxygenOS report of 0.4.72 to 0.4.74
+        # ran Vulkan and aborted the same way (A25 1578c3e9, 5979f592, b0f57229, e213e9be,
+        # ee0546c3; A33 0dbc9e00, 2368e662, ce33e392, ead48ebc). Now the three properties
+        # of the test above, MediaTek first (the A34 and A24 start with Vulkan). And the
+        # retry wait is switched off by name here, whatever set or did not set it: an
+        # unset, blank or leftover value must not decide whether SkiaGL waits for kgsl.
+        # Untested on a real A25/A33 until the first 0.4.81 report: look for this line.
+        REP="$(getprop ro.board.platform)/$(getprop ro.hardware)/$(getprop ro.soc.manufacturer)"
+        case "$REP" in
+            *mt[0-9]*|*[Mm]edia[Tt]ek*) ;;
+            *s5e[0-9]*|*erd[0-9]*|*exynos*|*universal[0-9]*|*[Ss]amsung*)
                 if [ -e /vendor/lib64/egl/libGLES_mali.so ] && [ ! -e /sys/class/kgsl/kgsl-3d0/gpu_model ]; then
-                    case "$rrv" in
-                        1|true) echo "guest_props: Mali Exynos with $RR=$rrv: Vulkan RenderEngine kept (SkiaGL would wait for kgsl)" ;;
-                        *) REV=""; echo "guest_props: Mali Exynos: the image's RenderEngine (SkiaGL; SkiaVk fails on this driver)" ;;
+                    # 0.4.85: Vulkan is kept only when ONEOS_GUEST_RE_RETRY=1 asks for the image's
+                    # retry value. Up to 0.4.84 a retry value still at 1 kept it, and the rewrite
+                    # above never ran (its grep), so every A25/A33 whose One UI did not hold the
+                    # property went on aborting in SkiaVk (0.4.83/0.4.84: 288aabca, 6435d433,
+                    # a89343dd, 7c78775c, d7efdb60; 32a0830e ran, One UI held it blank).
+                    rrk=$rrv; [ "${ONEOS_GUEST_RE_RETRY:-0}" = 1 ] || rrk=""
+                    case "$rrk" in
+                        1|true) echo "guest_props: Mali Exynos ($REP) with $RR=$rrv: Vulkan RenderEngine kept (ONEOS_GUEST_RE_RETRY=1; SkiaGL would wait for kgsl)" ;;
+                        *) REV=""; rrs="$RR=0 (was '$rrv')"
+                            case "$rrv" in
+                                0|false) ;;
+                                *)  if grep -qxF "$RR" "$HOST"; then
+                                        "$RP" -n "$RR" 0 && echo "$RR=$rrv" >> "$OVR" ||
+                                            rrs="!!! $RR could not be set to 0 (One UI holds '$rrv'): SkiaGL may wait for kgsl"
+                                    else
+                                        sed -i "/^persist\.sys\.renderengine\.retry=/d" "$NEW"
+                                        echo "$RR=0" >> "$NEW"
+                                    fi ;;
+                            esac
+                            echo "guest_props: Mali Exynos ($REP): the image's RenderEngine (SkiaGL; SkiaVk fails on this driver), $rrs" ;;
                     esac
                 fi ;;
         esac
@@ -402,6 +465,33 @@ add)
     }
     GUEST_OPLUS=0
     [ -f "$ROOTFS/system/framework/oplus-services.jar" ] && GUEST_OPLUS=1
+    # ColorOS's records of its last boot's kind, when One UI's own property store holds one
+    # (owner's Fold, 11-10: persist.sys.oplus.my_carrier.data_utc_backup with a date of August,
+    # written there by a session from before the store was kept apart (0.4.81); every One UI
+    # boot loads it and every return restores it as One UI's). The image has no such date, so
+    # OplusRemovableAppManager.isBootFromCotaUpdate took every start for the first one after a
+    # carrier-package update: "Upgrading from ...", every preinstalled app scanned and copied
+    # to data/app again, 30 "Failed to scan ... we try again" per boot. Blank for the session,
+    # memory only: ColorOS reads no record ("first boot consider as false", the path of 41 of
+    # the 45 ColorOS boots in the reports of 0.4.72 to 0.4.74) and writes its own, which the
+    # return drops. One UI's values go back with remove and restore-persist; its store is not
+    # touched. sys.oplus.bootupgrade is ColorOS's note of such a boot, left set by the session
+    # before (no One UI name). ONEOS_GUEST_OPLUS_BOOT_KIND=1 keeps them all.
+    if [ "$GUEST_OPLUS" = 1 ] && [ "${ONEOS_GUEST_OPLUS_BOOT_KIND:-0}" = 0 ]; then
+        out=""
+        for k in persist.sys.oplus.my_carrier.data_utc_backup persist.sys.oplus.company.data_backup \
+                 persist.sys.recopy.preload.opinstalled; do
+            hv=$(getprop "$k")
+            [ -n "$hv" ] || continue
+            if "$RP" -n "$k" "" 2>/dev/null && [ -z "$(getprop "$k")" ]; then
+                echo "$k=$hv" >> "$OVR"; out="$out $k"
+            fi
+        done
+        if [ -n "$(getprop sys.oplus.bootupgrade)" ] && "$RP" -n sys.oplus.bootupgrade "" 2>/dev/null; then
+            out="$out sys.oplus.bootupgrade"
+        fi
+        [ -z "$out" ] || echo "guest_props: ColorOS's last-boot records from an earlier session blanked for the session:$out"
+    fi
     if [ "${ONEOS_GUEST_BT_OFFLOAD:-0}" = 0 ] && [ "$GUEST_OPLUS" = 0 ]; then
         for k in persist.bluetooth.leaudio_offload.disabled; do
             if grep -qxF "$k" "$HOST"; then
@@ -907,6 +997,44 @@ add)
         echo "ro.oneos.vivo.dtype=$VDT" >> "$NEW"
         echo "guest_props: ro.oneos.vivo.dtype=$VDT (vivo's display and input side; apps: $(grep '^ro\.vivo\.device\.type=' "$NEW" | tail -n 1 | cut -d= -f2))"
     fi
+    # vivo OriginOS on a phone whose composer numbers its display mode groups by resolution
+    # (0.4.85). vivo's refresh-rate manager keeps flags of its own in a group's upper bits and
+    # refuses every mode whose group is 256 or more (vivo-services, PhysicalDisplayManager.
+    # rejectDisplayMode: group >> 8 != 0). One UI's composer on the S23 and S24 series says
+    # group=720/1080/1440 (the mode's width), so every mode went: "Display device added ...
+    # modeId -1", then "Unable to locate mode id=-1,supportedModes=[]" ended system_server
+    # about 60 s in, every time (S23 Ultra e565329d and 7dfec122; none of the nine
+    # OriginOS reports of the S23/S24 series reached the home screen). The S25 series says
+    # group=0 and runs. The manager's own off switch (GlobalConfigs.IS_SUPPORTED, read once in
+    # system_server and in the apps' framework) is this property: with it false no mode is
+    # refused and Android's own mode director picks the rate. Set only where One UI's
+    # SurfaceFlinger showed an active mode in such a group (display_modes_host.log,
+    # oneos_switch.sh). Untested on a real S23/S24 until the first 0.4.85 report: look for
+    # this line. ONEOS_GUEST_VIVO_RRM=1 keeps vivo's manager, 0 switches it off on any phone.
+    if [ -f "$ROOTFS/system/framework/vivo-services.jar" ]; then
+        VRM=persist.sys.vivo.refresh_rate_manager
+        VMG=$(grep -F 'activeMode={id=' "$STAGE/display_modes_host.log" 2>/dev/null | sed -n 's/.*, group=\([0-9]*\).*/\1/p' | sort -n | tail -n 1)
+        vrm=keep
+        case "${ONEOS_GUEST_VIVO_RRM:-auto}" in
+            1) ;;
+            0) vrm=off ;;
+            *) case "$VMG" in ''|*[!0-9]*) ;; *) [ "$VMG" -ge 256 ] && vrm=off ;; esac ;;
+        esac
+        if [ "$vrm" = off ]; then
+            vrs="$VRM=false for the session"
+            if grep -qxF "$VRM" "$HOST"; then
+                vrh=$(getprop "$VRM")
+                "$RP" -n "$VRM" false && echo "$VRM=$vrh" >> "$OVR" ||
+                    vrs="!!! $VRM could not be set to false (One UI holds '$vrh')"
+            else
+                sed -i '/^persist\.sys\.vivo\.refresh_rate_manager=/d' "$NEW"
+                echo "$VRM=false" >> "$NEW"
+            fi
+            echo "guest_props: $vrs (One UI's active display mode group: ${VMG:-not read}; vivo's refresh-rate manager refuses every mode of a group above 255)"
+        else
+            echo "guest_props: vivo's refresh-rate manager kept (One UI's active display mode group: ${VMG:-not read})"
+        fi
+    fi
     # Nothing OS's ringtones: NothingGenerateRingtoneService composes each with a
     # Glyph pattern from libgenerative_glyph, which sizes it by Nothing's vendor
     # props (ro.vendor.glyph.*, the Phone (3)'s 25 x 25 matrix). Samsung's
@@ -1250,10 +1378,15 @@ recover)
 store-on)
     # oneos_switch.sh, once One UI's system_server is gone (see STORE_MARK above).
     # Any failure leaves One UI's own store in place (the old way), never a half copy.
-    # Proven on vivo OriginOS only (0.4.73): other systems keep One UI's store unless
-    # ONEOS_PROPS_SESSION_STORE=1 asks for it.
-    PSS_DEF=0; grep -q ' vivo-services_patched\.jar$' "$STAGE/guards.txt" 2>/dev/null && PSS_DEF=1
-    [ "${ONEOS_PROPS_SESSION_STORE:-$PSS_DEF}" = 1 ] || { echo "guest_props: session property store off (ONEOS_PROPS_SESSION_STORE=${ONEOS_PROPS_SESSION_STORE:-$PSS_DEF})"; exit 0; }
+    # Every system (0.4.81). 0.4.73 and 0.4.74 used it for vivo OriginOS only, and
+    # six OriginOS reports from four phones show it whole ("One UI's own
+    # /data/property is back", "deleted 0 and blanked 456-494"). Without it a
+    # ColorOS 17 session deleted its 149 runtime persist names at the return and
+    # their slots stayed taken: 45, 27, then 9 KB left in system_prop, and the
+    # fourth switch since a restart was refused ("One UI's property space is
+    # nearly full": Galaxy A56 e0f70626, S24 Ultra 425a0ee1).
+    # ONEOS_PROPS_SESSION_STORE=0 keeps One UI's store in use (the old way).
+    [ "${ONEOS_PROPS_SESSION_STORE:-1}" = 1 ] || { echo "guest_props: session property store off (ONEOS_PROPS_SESSION_STORE=$ONEOS_PROPS_SESSION_STORE)"; exit 0; }
     snapshot_trusted || { echo "guest_props: no persist snapshot of this session, session property store not used"; exit 0; }
     [ -d "$PD" ] && [ ! -L "$PD" ] || { echo "guest_props: $PD is not a plain folder, session property store not used"; exit 0; }
     pd_mounted && { echo "guest_props: $PD is already a mount point, session property store not used"; exit 0; }
