@@ -105,16 +105,24 @@ step() { # <title> <seconds>
     echo "$(($2 * STEP_K)) $1" 2>/dev/null > "$CTL/return.watch"
     say "=== $1 ==="
 }
+# sync, waited for 5 s at most: a sync that stands still (a stuck disk or
+# FUSE) must not keep the reboot's last resorts from running.
+sync_bounded() {
+    sync &
+    sb=$!; sn=0
+    while [ $sn -lt 25 ] && [ -d "$P/$sb" ]; do sleep 0.2; sn=$((sn + 1)); done
+}
 do_reboot() { # <reason word>
     # Nothing of the session's on the screen while the phone restarts.
     bootui_end
-    sync
+    sync_bounded
     setprop sys.powerctl "reboot,$1"
     sleep 20
     # init did not reboot: Android's own reboot, then busybox's (KernelSU's busybox has no reboot applet: then it
     # only prints that), then sysrq as the last resort.
-    sync
-    [ -x "$T/system/bin/reboot" ] && "$T/system/bin/reboot" "$1"
+    sync_bounded
+    # (In the background: Android's reboot waits for init for ever once it set the property.)
+    [ -x "$T/system/bin/reboot" ] && "$T/system/bin/reboot" "$1" </dev/null >/dev/null 2>&1 &
     sleep 5
     [ -n "$BB" ] && "$BB" reboot -f
     sleep 5

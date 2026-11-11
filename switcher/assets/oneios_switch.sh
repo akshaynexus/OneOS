@@ -288,19 +288,27 @@ display_up() {
 TMO=""
 command -v timeout >/dev/null 2>&1 && TMO="timeout 5"
 
+# sync, waited for 5 s at most: a sync that stands still (a stuck disk or
+# FUSE) must not keep the reboot's last resorts from running.
+sync_bounded() {
+    sync &
+    sb=$!; sn=0
+    while [ $sn -lt 25 ] && [ -d "$P/$sb" ]; do sleep 0.2; sn=$((sn + 1)); done
+}
 # The reboot return without oneios_return.sh, for the watcher when that script
 # cannot be run or ends with an error: the same three steps as its failsafe.
 hard_reboot() { # <reason word> <why>
     echo "$(date '+%F %T') watcher: $2 - rebooting into One UI"
     bootui oneos_boot_stop
     echo "failsafe $(date +%s) $2" > "$STAGE/return.outcome"
-    sync
+    sync_bounded
     setprop sys.powerctl "reboot,$1"
     sleep 20
     # init did not reboot: Android's own reboot, then busybox's (a root manager's busybox may have no reboot
     # applet: then it only prints that), then sysrq.
-    sync
-    [ -x "$T/system/bin/reboot" ] && "$T/system/bin/reboot" "$1"
+    sync_bounded
+    # (In the background: Android's reboot waits for init for ever once it set the property.)
+    [ -x "$T/system/bin/reboot" ] && "$T/system/bin/reboot" "$1" </dev/null >/dev/null 2>&1 &
     sleep 5
     [ -n "$BB" ] && "$BB" reboot -f
     sleep 5
