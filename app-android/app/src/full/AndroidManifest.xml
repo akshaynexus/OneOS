@@ -10,6 +10,8 @@
          swiping the app away does not kill it half way; its notification shows the step. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- An import of the iOS image set (about 18 GB) goes on with the screen off; held only while it runs. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 0.4.45: the app's own update through Android's installer when root is off
          (AppUpdater); the user confirms each install. -->
@@ -20,6 +22,11 @@
     <application android:name=".ui.OneOsApplication">
         <service
             android:name=".session.PrepareService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- Holds the app while a OneiOS download or import runs (docs/oneios.md, "Importing either package"). -->
+        <service
+            android:name=".session.OneiosService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <receiver

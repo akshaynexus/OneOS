@@ -466,6 +466,53 @@ class OneiosScriptTest {
         assertRefused(f.receive("runtime", "bin/xnuhost", ELF, "0755"), "begin first")
     }
 
+    /**
+     * `take` copies with dd in 1 MiB blocks where dd counts in bytes, and with
+     * head -c where it does not. Three kinds of dd, as stand-ins in front of the
+     * machine's: GNU's and busybox's (count_bytes with fullblock), toybox's
+     * (count_bytes; it refuses fullblock) and one that knows neither. Each
+     * takes a file of several pipe buffers whole, and refuses a short one and
+     * a wrong SHA-256.
+     */
+    @Test
+    fun receiveCopiesWithWhicheverDdCountsInBytes() = each { f ->
+        val real = listOf("/usr/bin/dd", "/bin/dd").first { File(it).canExecute() }
+        val bin = File(f.root, "fakebin").apply { mkdirs() }
+        val used = File(f.root, "dd.used")
+        fun dd(body: String) = File(bin, "dd").apply {
+            writeText("#!/bin/sh\n$body\n")
+            setExecutable(true)
+        }
+        val data = ByteArray(700_001) { (it * 31 + it / 4099).toByte() }
+        val kinds = mapOf(
+            "toybox" to """case "$*" in *fullblock*) echo "dd: bad iflag" >&2; exit 1 ;; esac
+                           echo toybox >> $used
+                           exec $real "$@" iflag=count_bytes,fullblock""",
+            "none" to """case "$*" in *iflag*) echo "dd: bad arg" >&2; exit 1 ;; esac; exec $real "$@" """,
+            "gnu" to """echo gnu >> $used; exec $real "$@" """,
+        )
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("image")))
+        for ((kind, body) in kinds) {
+            dd(body)
+            used.delete()
+            val env = mapOf("PATH" to "${bin.path}:${System.getenv("PATH")}")
+            val name = "$kind.img"
+            val args = { size: Int, sha: String -> listOf("image", name, size.toString(), sha, "0644") }
+            assertRefused(f.verb(OneiosRoot.Verb.RECEIVE, args(data.size, "0".repeat(64)), data, env), "did not arrive intact")
+            assertRefused(f.verb(OneiosRoot.Verb.RECEIVE, args(data.size + 5, Hashes.sha256(data)), data, env), "${data.size} of ${data.size + 5} bytes")
+            assertFalse(File(f.stage, "image.new/$name").exists())
+            assertFalse(File(f.stage, "image.new/$name.part").exists())
+            assertOk(f.verb(OneiosRoot.Verb.RECEIVE, args(data.size, Hashes.sha256(data)), data, env))
+            assertTrue(kind, File(f.stage, "image.new/$name").readBytes().contentEquals(data))
+            // More than was announced: only the announced bytes are taken, and they are not the file.
+            val more = f.verb(OneiosRoot.Verb.RECEIVE, listOf("image", "$kind.more", "10", Hashes.sha256(data.copyOf(10)), "0644"), data, env)
+            assertOk(more)
+            assertEquals(10L, File(f.stage, "image.new/$kind.more").length())
+            // The copy itself went through dd, except where dd cannot count bytes.
+            assertEquals(kind, if (kind == "none") false else true, used.exists() && used.readText().trim().lines().all { it == kind })
+        }
+    }
+
     @Test
     fun theLauncherCarriesOnlyPlainArguments() {
         fun bad(verb: OneiosRoot.Verb, vararg args: String) =

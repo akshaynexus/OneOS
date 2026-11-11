@@ -4,9 +4,11 @@ import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -25,6 +27,11 @@ import dev.oneuiproject.oneui.layout.ToolbarLayout
  * runtime (downloaded from OneiOS's releases, or a file), the iOS image set
  * (always a file the user built), and the session with its experimental tick.
  * Everything it does is a job of [OneiosJob].
+ *
+ * The rows are built again only when something other than the byte count
+ * changes; the byte count, four times a second during a download or an import,
+ * moves the bar and one line of text in place. During such a copy the screen
+ * stays on, and OneiosService keeps it going when the app leaves the screen.
  */
 class OneiosActivity : EdgeToEdgeActivity() {
     private var unsubscribe: (() -> Unit)? = null
@@ -81,7 +88,21 @@ class OneiosActivity : EdgeToEdgeActivity() {
         super.onStop()
     }
 
+    /** The state the rows were built for, without its byte count. */
+    private var built: OneiosJob.State? = null
+    private var bar: ProgressBar? = null
+    private var barLine: TextView? = null
+
     private fun render(s: OneiosJob.State) {
+        if (s.copying) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val rows = s.copy(done = 0, total = if (s.total > 0) 1 else 0, bytesPerSecond = 0, etaSeconds = null)
+        if (rows == built) {
+            bindProgress(s)
+            return
+        }
+        built = rows
+        bar = null
+        barLine = null
         val list = findViewById<LinearLayout>(R.id.oneios_list)
         list.removeAllViews()
         val idle = !s.busy
@@ -92,10 +113,18 @@ class OneiosActivity : EdgeToEdgeActivity() {
         // What is happening now, or how the last action ended.
         if (s.message != null) {
             val card = PrebootCards.section(list)
-            val line = if (s.busy && s.total > 0) {
-                "${Units.bytes(s.done)} of ${Units.bytes(s.total)} (${(s.done * 100 / s.total).coerceIn(0, 100)}%)"
-            } else null
-            PrebootCards.row(card, s.message, line)
+            PrebootCards.row(card, s.message, s.file)
+            if (s.copying) {
+                // The bar and the line under it: the only views a byte count touches.
+                bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+                barLine = TextView(this).apply {
+                    textSize = 14f
+                    setTextColor(getColor(R.color.preboot_secondary))
+                }
+                card.addView(bar, LinearLayout.LayoutParams(-1, -2).apply { marginStart = dp(24); marginEnd = dp(24) })
+                card.addView(barLine, LinearLayout.LayoutParams(-1, -2).apply { marginStart = dp(24); marginEnd = dp(24); topMargin = dp(6); bottomMargin = dp(14) })
+                bindProgress(s)
+            }
             if (s.busy && s.phase != OneiosJob.Phase.CHECKING && s.phase != OneiosJob.Phase.SWITCHING) {
                 PrebootCards.row(card, getString(R.string.oneios_stop)) { OneiosJob.cancel() }
             }
@@ -181,6 +210,13 @@ class OneiosActivity : EdgeToEdgeActivity() {
             }
         }
         updateSwitch()
+    }
+
+    private fun bindProgress(s: OneiosJob.State) {
+        val b = bar ?: return
+        b.isIndeterminate = s.total <= 0
+        if (s.total > 0) b.progress = (s.done * 1000 / s.total).toInt().coerceIn(0, 1000)
+        barLine?.text = s.progressLine ?: getString(R.string.oneios_measuring)
     }
 
     /** Switch is enabled only with the tick, on this phone, when root's own preflight would pass. */

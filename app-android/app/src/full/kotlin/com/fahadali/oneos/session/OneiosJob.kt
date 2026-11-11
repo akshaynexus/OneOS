@@ -3,17 +3,20 @@ package com.fahadali.oneos.session
 import android.content.Context
 import android.net.Uri
 import com.fahadali.oneos.BuildConfig
+import android.os.SystemClock
 import com.fahadali.oneos.core.device.FactProbe
+import com.fahadali.oneos.core.model.ByteMeter
 import com.fahadali.oneos.core.model.Hashes
 import com.fahadali.oneos.core.model.Level
+import com.fahadali.oneos.core.model.OneiosFile
 import com.fahadali.oneos.core.model.OneiosKind
 import com.fahadali.oneos.core.model.OneiosManifest
 import com.fahadali.oneos.core.model.OneiosManifests
-import com.fahadali.oneos.core.model.OneiosPackage
 import com.fahadali.oneos.core.model.OneiosReleases
 import com.fahadali.oneos.core.model.OneiosSystem
 import com.fahadali.oneos.core.model.Profiles
 import com.fahadali.oneos.core.model.Units
+import com.fahadali.oneos.core.root.OneiosImport
 import com.fahadali.oneos.core.root.OneiosRoot
 import com.fahadali.oneos.core.root.OneiosStatus
 import com.fahadali.oneos.core.root.RootProbe
@@ -35,9 +38,12 @@ import java.security.MessageDigest
  * switch, and remove. Each change is a verb of `oneios_root.sh` through
  * [OneiosRoot]'s launcher; the image set is never downloaded.
  *
- * A package is read twice from its source: once for its manifest, once to
- * hand every listed file to root (`receive`), hashed by the app on the way and
- * by root as it lands. Nothing replaces what is staged until `finish`.
+ * A package goes to root over the road an Android system's image takes
+ * ([RootShell] into the root script's `receive`), by [OneiosImport]: one pass
+ * over the file when its manifest comes first, every listed file hashed by the
+ * app on the way and by root once it has landed. Nothing replaces what is
+ * staged until `finish`. While it runs [OneiosService] keeps the app alive and
+ * the screen hears of the bytes four times a second ([ByteMeter], as setup does).
  */
 object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
     enum class Phase { IDLE, CHECKING, DOWNLOADING, STAGING, SWITCHING, REMOVING }
@@ -53,15 +59,33 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         val failed: Boolean = false,
         val done: Long = 0,
         val total: Long = 0,
+        /** The file being sent, "File 3 of 21: os.img (10.6 GB)"; null when the step has none. */
+        val file: String? = null,
+        /** Bytes a second, a moving average; 0 = not measured yet. */
+        val bytesPerSecond: Long = 0,
+        /** Seconds left; null = still estimating. */
+        val etaSeconds: Int? = null,
     ) {
         val busy: Boolean get() = phase != Phase.IDLE
+
+        /** A long copy runs (a download, an import): the screen stays on and [OneiosService] holds the app. */
+        val copying: Boolean get() = phase == Phase.DOWNLOADING || phase == Phase.STAGING
+
+        /** "3.2 GB of 17.9 GB (18%) · 412 MB/s · about 2 min left", or null without a byte count. */
+        val progressLine: String?
+            get() = if (!busy || total <= 0) null else listOfNotNull(
+                "${Units.bytes(done)} of ${Units.bytes(total)} (${(done * 100 / total).coerceIn(0, 100)}%)",
+                ByteMeter.speed(bytesPerSecond),
+                etaSeconds?.let(ByteMeter::left),
+            ).joinToString(" · ")
     }
 
     private class Failed(message: String) : IOException(message)
 
     @Volatile private var cancelled = false
 
-    @Volatile private var shell: RootShell? = null
+    /** The root commands that run now: one, or two while root still checks a large file and the next is sent. */
+    private val shells = java.util.concurrent.ConcurrentHashMap.newKeySet<RootShell>()
 
     @Volatile private var connection: HttpURLConnection? = null
 
@@ -72,7 +96,7 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
 
     fun cancel() {
         cancelled = true
-        shell?.cancel()
+        shells.forEach { it.cancel() }
         runCatching { connection?.disconnect() }
     }
 
@@ -114,12 +138,13 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
             OneiosRoot.Stdin.NONE -> null
         }
         val sh = RootShell(command)
-        shell = sh
+        shells += sh
         val reply = RootReply()
         val end = try {
+            if (cancelled) sh.cancel()
             sh.run(input, { line -> reply.accept(line) }, { silenceMs }, totalMs)
         } finally {
-            shell = null
+            shells -= sh
         }
         return Reply(reply, end)
     }
@@ -140,7 +165,10 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         if (!canStart()) return
         val app = ctx.applicationContext
         cancelled = false
-        update(state.copy(phase = phase, message = first, failed = false, done = 0, total = 0))
+        meter.reset()
+        update(state.copy(phase = phase, message = first, failed = false, done = 0, total = 0, file = null, bytesPerSecond = 0, etaSeconds = null))
+        // Before the work, from the screen the user tapped: Android only lets a visible app start it.
+        if (state.copying) OneiosService.start(app)
         executor.execute {
             val result = runCatching { work(app) }
             val offered = state.offered ?: offered(app)
@@ -172,6 +200,7 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         val file = File(dir, release.assetName)
         try {
             download(release.assetUrl, file, release.assetBytes, sha)
+            meter.reset()
             val m = stage(app, OneiosKind.RUNTIME) { file.inputStream() }
             runtimeLine(m) + " (release ${release.tag})"
         } finally {
@@ -225,88 +254,65 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
         // The window both packages are packed with is at most 2^27 (OneiOS's oneos/interface.md).
         ZstdInputStream(BufferedInputStream(raw, 1 shl 20)).setContinuous(false).setLongMax(27)
 
-    private fun progress(what: String, done: Long, total: Long) {
+    /** The bytes of a long copy, as setup counts them: the screen hears of them every 250 ms. */
+    private val meter = ByteMeter(SystemClock::elapsedRealtime, updateMs = 250, estimateMs = 5000)
+
+    /** A new step: shown at once. */
+    private fun step(what: String, file: String? = null) {
         val s = state
-        // A state per MB at most.
-        if (s.message == what && done - s.done < (1 shl 20) && done < total) return
-        update(s.copy(message = what, done = done, total = total))
+        if (s.message == what && s.file == file) return
+        update(s.copy(message = what, file = file))
+    }
+
+    /**
+     * [done] of [total] bytes, called for every buffer. 0.4.76 sent the screen a
+     * state for every MiB, a few hundred a second, and the screen built all its
+     * rows again for each one: that was the lag during an import.
+     */
+    private fun bytes(done: Long, total: Long, force: Boolean = false) {
+        val m = meter.tick(done, total, force) ?: return
+        update(state.copy(done = m.done, total = m.total, bytesPerSecond = m.bytesPerSecond, etaSeconds = m.etaSeconds))
     }
 
     private fun stage(app: Context, kind: OneiosKind, open: () -> InputStream): OneiosManifest {
-        val label = kind.label
-        progress("Reading the $label's ${kind.manifestName}…", 0, 0)
-        val found = try {
-            tar(open()).use { OneiosPackage.readManifest(it, kind) }
-        } catch (e: IOException) {
-            throw Failed(notOurs(kind, e))
-        }
-        val manifest = OneiosManifests.parse(kind, found.text).getOrElse { throw Failed(it.message ?: "${kind.manifestName} is not valid") }
-        if (kind == OneiosKind.RUNTIME && manifest.sessionAbi != OneiosSystem.SESSION_ABI) {
-            throw Failed("This runtime speaks session ABI ${manifest.sessionAbi}; this version of OneOS speaks ${OneiosSystem.SESSION_ABI}.")
-        }
-        manifest.minOneosFork?.let { need ->
-            if (!OneiosManifests.versionAtLeast(BuildConfig.VERSION_NAME, need)) {
-                throw Failed("This runtime needs OneOS $need or newer; this is ${BuildConfig.VERSION_NAME}.")
-            }
-        }
-        val total = manifest.bytes
-        must(root(app, OneiosRoot.Verb.BEGIN, listOf(kind.word)))
-        // The session scripts this build pins, with every staging: they are small, and always this app's.
-        for ((name, pin) in listOf("oneios_switch.sh" to BuildConfig.ONEIOS_SWITCH_SHA256, "oneios_return.sh" to BuildConfig.ONEIOS_RETURN_SHA256)) {
+        val scripts = listOf("oneios_switch.sh" to BuildConfig.ONEIOS_SWITCH_SHA256, "oneios_return.sh" to BuildConfig.ONEIOS_RETURN_SHA256).map { (name, pin) ->
+            // The session scripts this build pins, with every staging: they are small, and always this app's.
             val b = app.assets.open("oneios/$name").use { it.readBytes() }
             if (Hashes.sha256(b) != pin) throw Failed("$name in the app is not the pinned one")
-            must(root(app, OneiosRoot.Verb.SCRIPT, listOf(name, b.size.toString(), pin), RootShell.Feed { it.write(b) }))
+            OneiosImport.Script(name, b, pin)
         }
-        val text = found.text.toByteArray(Charsets.UTF_8)
-        must(root(app, OneiosRoot.Verb.RECEIVE, listOf(kind.word, kind.manifestName, text.size.toString(), Hashes.sha256(text), "0644"),
-            RootShell.Feed { it.write(text) }))
-        try {
-            tar(open()).use { stream ->
-                OneiosPackage.unpack(stream, manifest, found.prefix, { f, data ->
-                    if (cancelled) throw Failed("stopped")
-                    val what = "Staging ${f.path} (${Units.bytes(f.size)})"
-                    progress(what, state.done, total)
-                    val r = root(
-                        app, OneiosRoot.Verb.RECEIVE, listOf(kind.word, f.path, f.size.toString(), f.sha256, f.mode),
-                        RootShell.Feed { out ->
-                            val buf = ByteArray(1 shl 20)
-                            while (true) {
-                                if (cancelled) throw IOException("stopped")
-                                val n = data.read(buf)
-                                if (n < 0) break
-                                out.write(buf, 0, n)
-                            }
-                        },
-                        // Root hashes the file after the last byte: minutes for several GB.
-                        silenceMs = 20 * 60_000L,
-                    )
-                    must(r)
-                }) { done -> progress(state.message ?: label, done, total) }
+        val root = object : OneiosImport.Root {
+            override fun run(verb: OneiosRoot.Verb, args: List<String>, feed: RootShell.Feed?, silenceMs: Long): String? {
+                val r = root(app, verb, args, feed, silenceMs)
+                return if (r.ok) null else r.problem
             }
-        } catch (e: Failed) {
-            throw e
-        } catch (e: IOException) {
-            throw Failed("The $label is damaged or incomplete: ${e.message}. Nothing staged before was changed.")
-        }
-        progress("Putting the $label in place…", total, total)
-        val count = (manifest.files.size + 1).toString()
-        val finish = when (kind) {
-            OneiosKind.RUNTIME -> listOf(
-                kind.word, count, manifest.version, manifest.sessionAbi.toString(), manifest.xnuhost!!,
-                manifest.imageFormats.joinToString(","), if (manifest.placeholder) "1" else "0",
-            )
-            OneiosKind.IMAGE -> listOf(kind.word, count, manifest.format.toString(), manifest.version, manifest.build ?: "unknown")
-        }
-        must(root(app, OneiosRoot.Verb.FINISH, finish, silenceMs = 10 * 60_000L))
-        return manifest
-    }
 
-    private fun notOurs(kind: OneiosKind, e: IOException): String {
-        val m = e.message.orEmpty()
-        return when {
-            e is OneiosPackage.Problem -> m
-            m.contains("tar") -> "This file is not a ${kind.label} ($m)."
-            else -> "This file is not a .tar.zst ${kind.label}: $m"
+            override fun abandon() = shells.forEach { it.cancel() }
+        }
+        val listener = object : OneiosImport.Listener {
+            override fun step(text: String) = step(text, null)
+
+            override fun file(index: Int, count: Int, file: OneiosFile) =
+                step("Staging the ${kind.label}", OneiosImport.fileLine(index, count, file))
+
+            override fun bytes(done: Long, total: Long) = bytes(done, total, force = done >= total)
+
+            override fun stopped(): Boolean = cancelled
+        }
+        try {
+            return OneiosImport(kind, root, listener).run({ tar(open()) }, scripts) { manifest ->
+                if (kind == OneiosKind.RUNTIME && manifest.sessionAbi != OneiosSystem.SESSION_ABI) {
+                    throw Failed("This runtime speaks session ABI ${manifest.sessionAbi}; this version of OneOS speaks ${OneiosSystem.SESSION_ABI}.")
+                }
+                manifest.minOneosFork?.let { need ->
+                    if (!OneiosManifests.versionAtLeast(BuildConfig.VERSION_NAME, need)) {
+                        throw Failed("This runtime needs OneOS $need or newer; this is ${BuildConfig.VERSION_NAME}.")
+                    }
+                }
+                bytes(0, manifest.bytes, force = true)
+            }.manifest
+        } catch (e: OneiosImport.Failed) {
+            throw Failed(e.message ?: "the import failed")
         }
     }
 
@@ -361,6 +367,8 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
             if (code != 200) throw Failed("${file.name} could not be downloaded ($code)")
             val md = MessageDigest.getInstance("SHA-256")
             var n = 0L
+            step("Downloading ${file.name} (${Units.bytes(bytes)})")
+            meter.reset()
             c.inputStream.use { input ->
                 file.outputStream().use { out ->
                     val buf = ByteArray(1 shl 16)
@@ -372,7 +380,7 @@ object OneiosJob : BackgroundJob<OneiosJob.State>(State(), "oneos-oneios") {
                         if (n > bytes) throw Failed("${file.name} is larger than its release says")
                         md.update(buf, 0, k)
                         out.write(buf, 0, k)
-                        progress("Downloading ${file.name} (${Units.bytes(bytes)})", n, bytes)
+                        bytes(n, bytes)
                     }
                 }
             }

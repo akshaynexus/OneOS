@@ -182,10 +182,28 @@ do_begin() {
 
 # Reads exactly <bytes> bytes of stdin into <file>.part, checks size and
 # SHA-256, and only then gives it its name.
+#
+# The copy is dd in 1 MiB blocks where dd can count in bytes: toybox's head -c
+# copies 4 KiB at a time, two system calls for every 4 KiB of a 10 GiB file.
+# toybox's dd counts the bytes it read (iflag=count_bytes); GNU's and
+# busybox's also need fullblock, or a short read from the pipe counts as a
+# whole block, and toybox's refuses that word. Which one this dd is is found
+# by copying two bytes of three; a dd that does neither leaves head -c, as
+# before. The size is checked after the copy in any case. The SHA-256 is of
+# the file as it is on the disk, read again after the last byte.
+copy_bytes() { # <bytes>: stdin to stdout, exactly that many
+    if [ "$(printf abc | dd bs=1M iflag=count_bytes,fullblock count=2 2>/dev/null)" = ab ]; then
+        dd bs=1M iflag=count_bytes,fullblock count="$1" 2>/dev/null
+    elif [ "$(printf abc | dd bs=1M iflag=count_bytes count=2 2>/dev/null)" = ab ]; then
+        dd bs=1M iflag=count_bytes count="$1" 2>/dev/null
+    else
+        head -c "$1"
+    fi
+}
 take() { # <file> <bytes> <sha256> <mode>
     f=$1
     rm -f "$f.part"
-    head -c "$2" > "$f.part" || { rm -f "$f.part"; die "could not write ${f##*/}"; }
+    copy_bytes "$2" > "$f.part" || { rm -f "$f.part"; die "could not write ${f##*/}"; }
     got=$(stat -c %s "$f.part" 2>/dev/null)
     [ "$got" = "$2" ] || { rm -f "$f.part"; refuse "${f##*/}: $got of $2 bytes arrived"; }
     [ "$(sha "$f.part")" = "$3" ] || { rm -f "$f.part"; refuse "${f##*/} did not arrive intact (SHA-256 differs)"; }
@@ -291,6 +309,9 @@ do_finish() {
         fi
         echo "staged=$(date +%s)"
     } > "$c" && own "$c" 0600 || die "could not write $kind.conf"
+    # What was received is on the disk before it counts as staged: a switch may
+    # end in a restart. Once, here, not after every file.
+    [ -n "$T" ] || sync
     # The old one aside, the new one in, then the old one gone. The guest's
     # data ($STAGE/data) is not touched: a new runtime or image keeps it.
     old="$STAGE/$kind.old-$$"

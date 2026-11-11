@@ -53,13 +53,80 @@ Choose a system → **iOS 27 (OneiOS)** → Open (`OneiosActivity`, `OneiosJob`)
 - **Hardware checks**: a screen of its own (`OneiosChecksActivity`), below.
 - **Session logs**: a screen of its own (`OneiosLogsActivity`), below.
 
-Importing either package: the app reads the tar twice. First for the manifest, which it parses and checks
-(`OneiosManifests.parse`: format version, plain relative paths, sizes, SHA-256s, no duplicates; a runtime must
-name an xnuhost that is one of its files with mode 0755). Then every member is handed to root's `receive` while
-the app hashes it (`OneiosPackage.unpack`): a member the manifest does not list, a wrong size, a wrong SHA-256, a
-missing file, a link or a device ends the import. Root checks each file's size and SHA-256 again as it writes it
-into `<kind>.new`, and only `finish` puts the new runtime or image in place of the old one. A failed import leaves
-what was staged before untouched.
+### Importing either package
+
+The import goes over the road an Android system's image takes (`PrepareJob`): the app unpacks, `RootShell` streams
+each file into `su`'s stdin, the root script's `receive` writes it and checks its size and SHA-256, and a
+foreground service keeps the app alive. `OneiosImport` (`:core:root`) runs it; the parts both systems use are
+shared, not copied:
+
+| Part | Android system (`PrepareJob`) | iOS package (`OneiosJob`, `OneiosImport`) |
+|---|---|---|
+| Unpacking | in the app, `GZIPInputStream` | in the app, zstd-jni's `ZstdInputStream` (window up to 2^27) |
+| To root | `RootShell.Feed` into `oneos_root.sh receive` | the same `RootShell.Feed` into `oneios_root.sh receive` |
+| Check | the app hashes while it sends; root hashes the file it wrote and refuses a mismatch | the same |
+| Progress | `ByteMeter`: the screen hears of the bytes every 250 ms, with the time left | the same `ByteMeter`, also the speed |
+| Kept alive by | `PrepareService` (`KeepAliveService`) | `OneiosService` (`KeepAliveService`), which also holds a CPU wakelock while the copy runs |
+
+What the iOS import does on top, because a package is 21 files and about 18 GB behind one zstd stream:
+
+- **One pass.** OneiOS packs `manifest.json` (and `runtime.json`) as the archive's first file. The app reads it
+  from there (`OneiosPackage.manifestFirst`), checks it (`OneiosManifests.parse`: format version, plain relative
+  paths, sizes, SHA-256s, no duplicates; a runtime must name an xnuhost that is one of its files with mode 0755)
+  and goes on in the same stream. A package whose manifest is not first is read twice, as before 0.4.78: once to
+  find the manifest, once to unpack.
+- **Three threads for a file.** One reads ahead through the decompressor (`ReadAhead`, 4 MiB buffers), one
+  writes to root's stdin in 4 MiB writes, one hashes the buffer being written (`HashedCopy`). Before 0.4.78 one
+  thread did all three in turn, 1 MiB at a time.
+- **Root's check of a large file runs while the next file is sent.** `receive` hashes the file it wrote by
+  reading it again. For a file of 64 MiB or more the app starts the next `receive` meanwhile and takes root's
+  answer before the file after that is done, and before `finish`. Smaller files are answered one at a time.
+- **`receive` copies with `dd` in 1 MiB blocks** (`copy_bytes` in `oneios_root.sh`): toybox's `head -c` copies
+  4 KiB at a time. It uses `iflag=count_bytes,fullblock` (GNU, busybox) or `iflag=count_bytes` (toybox, which
+  counts the bytes it read and refuses `fullblock`), found by copying two bytes of three; a `dd` that does
+  neither leaves `head -c`.
+- **`finish` runs `sync` once** before it puts the new runtime or image in place.
+
+What holds as before: a member the manifest does not list, a wrong size, a wrong SHA-256, a missing file, a
+link or a device ends the import. Root refuses a file whose size or SHA-256 is not what `receive` was told and
+removes its `.part`. Files land in `<kind>.new`, and only `finish`, which is asked for after root has answered
+OK for every file, puts the new runtime or image in place of the old one. A failed import leaves what was staged
+before untouched.
+
+The screen during an import: the file being sent (`File 3 of 21: os.img (10.6 GB)`), a bar, and
+`3.2 GB of 17.9 GB (18%) · 412 MB/s · about 2 min left`. The rows are built again only when the step or the
+file changes; the byte count moves the bar and that line. Before 0.4.78 the job sent a state for every MiB (a few
+hundred a second) and the screen built all its rows again for each: that was the lag. The screen stays on while a
+download or an import runs (`FLAG_KEEP_SCREEN_ON`), and with the screen off or the app in the background
+`OneiosService` keeps it going; its notification shows the same line. *Stop* ends it.
+
+#### Measuring the import
+
+`OneiosImportBench` (`:core:root` tests) times the stages and the whole import on a PC against the root script
+and a fake root folder. It needs a synthetic package (random and repeated bytes, `manifest.json` first; never
+Apple's files) and runs only when asked:
+
+```
+ONEIOS_BENCH_PACKAGE=<synthetic .tar.zst> ONEIOS_BENCH_DIR=<folder on a disk> \
+  [ONEIOS_BENCH_OLD_SCRIPT=<oneios_root.sh of 0.4.76>] \
+  ./gradlew :core:root:testDebugUnitTest --rerun --tests '*OneiosImportBench*'
+```
+
+On the development PC (x86-64, NVMe, bash and GNU tools), a 4.0 GiB set of 21 files packed like the real one
+(`zstd -10 --long=27`, 2.35 GiB):
+
+| | 0.4.76 | 0.4.78 |
+|---|---|---|
+| The whole import | 242 MB/s (17.7 s) | 577 MB/s (7.4 s); 474 MB/s in another run |
+| Screen updates sent | 4079 (about 230 a second) | 26 (about 4 a second) |
+| Root's `receive` alone, 1 GiB: the write | 1.58 s (`head -c`); 1.25 s in another run | 1.05 s (`dd bs=1M`) |
+| Root's `receive` alone, 1 GiB: the SHA-256 after it | 1.18 s | 1.15 s, now beside the next file |
+
+The stages alone there: zstd 1400 to 1600 MB/s, SHA-256 in the JVM 990 MB/s, zstd with tar and SHA-256 on one
+thread 660 MB/s. Without the app's own SHA-256 the whole import was 580 MB/s (507 in the other run), within the
+spread between runs, so that hash stays as the second check. **None of
+this has been measured on the phone**: its `dd`, `head` and `sha256sum` are toybox's, its storage and cores are
+others, and the `iflag=count_bytes` branch of `copy_bytes` runs in the tests only behind a stand-in.
 
 ## Hardware checks
 
@@ -375,6 +442,19 @@ the two meet at the return's lock.
   the two verbs' text has no write and a time limit on every read; the return's own log, written by the real
   scripts on the fake phone, gives the summary's "Return:" line. `ReadOnlyListsTest`: `logs.oneios` passes the
   read-only audit and names only the log files. Not covered by any test: the two screens.
+- **The import.** `core/model` `TransferTest`: the screen hears of the bytes at most four times a second however
+  often they are counted, the speed and the time left; reading ahead gives the same bytes in any read size, hands
+  an error of its source over where it happened and lets only its own thread close the source; the copy that
+  hashes beside the write. `OneiosTest`: a manifest that is the first file is read in the same pass as the files,
+  one that is not is found by going on. `core/root` `OneiosImportTest` runs `OneiosImport` through `RootShell`
+  (a shell in `su`'s place) against the root script and a fake root, from `.tar.zst` packages made in the test:
+  one pass and one opening of the file when the manifest is first, two when it is not; root refusing a file
+  whose SHA-256 is not the manifest's with the app's own hash off, and what was staged before left as it was;
+  a link, an unlisted file, a cut-off archive, a file that is not a package, a missing file; a large file
+  checked by root while the next is sent, and its refusal ending the import; Stop. `OneiosScriptTest`:
+  `receive` with three kinds of `dd` (GNU's, a stand-in that refuses `fullblock` like toybox's, one that takes no
+  `iflag`) takes a file of several pipe buffers whole, takes no more than it was told, and refuses a short file
+  and a wrong SHA-256. Not covered by any test: toybox's own `dd`, the screen, the service and the wakelock.
 - `./gradlew :core:model:test :core:root:testDebugUnitTest`. The app itself needs the SESL9 libraries from
   GitHub Packages (a token in `~/.config/twidget/github.properties`), as before this change.
 

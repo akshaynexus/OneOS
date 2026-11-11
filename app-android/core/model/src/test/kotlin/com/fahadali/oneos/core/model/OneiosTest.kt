@@ -289,6 +289,72 @@ class OneiosTest {
     }
 
     @Test
+    fun aManifestThatIsTheFirstFileIsReadInTheSamePassAsTheFiles() {
+        // As OneiOS packs both: the manifest, then the files, folders in between.
+        val tar = Tar().file("manifest.json", imageJson().toByteArray()).file("os.img", os).dir("overlay")
+            .file("overlay/kernel.kc", kc).bytes()
+        var opened = 0
+        var read = 0L
+        val stream = object : ByteArrayInputStream(tar) {
+            init {
+                opened++
+            }
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int = super.read(b, off, len).also { if (it > 0) read += it }
+        }
+        val reader = TarReader(stream)
+        val found = OneiosPackage.manifestFirst(reader, OneiosKind.IMAGE)!!
+        assertEquals("", found.prefix)
+        // Only the manifest's own blocks were read so far.
+        assertTrue("$read bytes read for the manifest", read <= 512 + 1024L)
+        val m = OneiosManifests.parse(OneiosKind.IMAGE, found.text).getOrThrow()
+        val got = LinkedHashMap<String, ByteArray>()
+        // The same reader goes on behind the manifest; this copier leaves the hashing to root.
+        val seen = OneiosPackage.unpack(reader, m, found.prefix, OneiosPackage.Copier { f, data ->
+            got[f.path] = data.readBytes()
+            null
+        })
+        assertEquals(listOf("os.img", "overlay/kernel.kc"), got.keys.toList())
+        assertTrue(got.getValue("os.img").contentEquals(os))
+        assertEquals(2, seen.size)
+        assertEquals(1, opened)
+        // Every byte of the archive went by once.
+        assertTrue("$read of ${tar.size}", read <= tar.size)
+        // Under one top folder too.
+        val top = Tar().dir("set").file("set/manifest.json", imageJson().toByteArray()).file("set/os.img", os)
+            .file("set/overlay/kernel.kc", kc).bytes()
+        assertEquals("set/", OneiosPackage.manifestFirst(TarReader(ByteArrayInputStream(top)), OneiosKind.IMAGE)!!.prefix)
+    }
+
+    @Test
+    fun aManifestThatIsNotFirstIsFoundByGoingOn() {
+        val tar = Tar().dir("overlay").file("os.img", os).file("overlay/kernel.kc", kc).file("manifest.json", imageJson().toByteArray()).bytes()
+        val reader = TarReader(ByteArrayInputStream(tar))
+        assertEquals(null, OneiosPackage.manifestFirst(reader, OneiosKind.IMAGE))
+        // The same reader finds it further on; the files before it then need a second pass.
+        assertTrue(OneiosPackage.readManifest(reader, OneiosKind.IMAGE).text.contains("oneios-image"))
+        // No manifest at all.
+        val none = Tar().file("os.img", os).bytes()
+        val e = runCatching { OneiosPackage.readManifest(TarReader(ByteArrayInputStream(none)).also { OneiosPackage.manifestFirst(it, OneiosKind.IMAGE) }, OneiosKind.IMAGE) }
+        assertTrue(e.exceptionOrNull() is OneiosPackage.Problem)
+    }
+
+    @Test
+    fun aCopierThatHashedIsHeldToTheManifest() {
+        val tar = Tar().file("manifest.json", imageJson().toByteArray()).file("os.img", os).file("overlay/kernel.kc", kc).bytes()
+        val reader = TarReader(ByteArrayInputStream(tar))
+        val found = OneiosPackage.manifestFirst(reader, OneiosKind.IMAGE)!!
+        val m = OneiosManifests.parse(OneiosKind.IMAGE, found.text).getOrThrow()
+        val e = runCatching {
+            OneiosPackage.unpack(reader, m, found.prefix, OneiosPackage.Copier { _, data ->
+                data.readBytes()
+                "0".repeat(64)
+            })
+        }.exceptionOrNull()
+        assertTrue(e is OneiosPackage.Problem && e.message!!.contains("does not match its SHA-256"))
+    }
+
+    @Test
     fun theManifestMayComeLastAndUnderOneTopFolder() {
         val tar = Tar().dir("oneios-runtime-0.1.0").dir("oneios-runtime-0.1.0/bin")
             .file("bin/xnuhost", xnuhost, prefix = "oneios-runtime-0.1.0").paxFile("oneios-runtime-0.1.0/bin/stub", stub)

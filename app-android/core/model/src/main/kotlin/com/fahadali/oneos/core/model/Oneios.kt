@@ -644,9 +644,11 @@ class TarReader(private val input: InputStream) {
 
 /**
  * Reads a runtime package or an image set (the tar inside the `.tar.zst`; the
- * caller decompresses) in two passes over the same file:
- *  1. [readManifest]: finds the manifest, at the top or under one top folder,
- *     and stops there (at once when it is the first member);
+ * caller decompresses):
+ *  1. the manifest, at the top or under one top folder: [manifestFirst] when it
+ *     is the archive's first file (OneiOS packs both packages so), and the
+ *     same reader then goes on, one pass; otherwise [readManifest], which finds
+ *     it anywhere, and a second pass over the file;
  *  2. [unpack]: hands every listed file to the sink while hashing it, and
  *     refuses anything the manifest does not list, a wrong size, a wrong
  *     SHA-256 and a missing file.
@@ -663,16 +665,45 @@ object OneiosPackage {
         fun file(file: OneiosFile, data: InputStream)
     }
 
-    fun readManifest(tar: InputStream, kind: OneiosKind): Found {
-        val reader = TarReader(tar)
+    /**
+     * Like [Sink], for a reader that hashes on its own (or leaves it to root):
+     * returns the SHA-256 of what it read, or null when it did not hash, and then
+     * root's check of the file is the only one.
+     */
+    fun interface Copier {
+        fun file(file: OneiosFile, data: InputStream): String?
+    }
+
+    private fun manifestOf(reader: TarReader, e: TarReader.Entry, kind: OneiosKind): Found? {
+        val parts = e.name.split('/')
+        if (parts.last() != kind.manifestName || parts.size > 2) return null
+        if (e.size > OneiosManifests.MAX_MANIFEST_BYTES) throw Problem("${kind.manifestName} is too long")
+        val text = reader.data().readBytes().toString(Charsets.UTF_8)
+        return Found(if (parts.size == 2) parts[0] + "/" else "", text)
+    }
+
+    fun readManifest(tar: InputStream, kind: OneiosKind): Found = readManifest(TarReader(tar), kind)
+
+    /** The manifest wherever it is from where [reader] stands; the reader stops behind it. */
+    fun readManifest(reader: TarReader, kind: OneiosKind): Found {
         while (true) {
             val e = reader.next() ?: throw Problem("no ${kind.manifestName} in this file: it is not a ${kind.label}")
             if (e.directory) continue
-            val parts = e.name.split('/')
-            if (parts.last() != kind.manifestName || parts.size > 2) continue
-            if (e.size > OneiosManifests.MAX_MANIFEST_BYTES) throw Problem("${kind.manifestName} is too long")
-            val text = reader.data().readBytes().toString(Charsets.UTF_8)
-            return Found(if (parts.size == 2) parts[0] + "/" else "", text)
+            return manifestOf(reader, e, kind) ?: continue
+        }
+    }
+
+    /**
+     * The manifest when it is the archive's first file, as OneiOS packs both
+     * packages: [reader] then stands behind it and [unpack] goes on from there,
+     * so the archive is read (and decompressed) once. Null when another file
+     * comes first: read the archive again with [readManifest].
+     */
+    fun manifestFirst(reader: TarReader, kind: OneiosKind): Found? {
+        while (true) {
+            val e = reader.next() ?: throw Problem("no ${kind.manifestName} in this file: it is not a ${kind.label}")
+            if (e.directory) continue
+            return manifestOf(reader, e, kind)
         }
     }
 
@@ -683,9 +714,38 @@ object OneiosPackage {
         prefix: String,
         sink: Sink,
         progress: (Long) -> Unit = {},
+    ): List<OneiosSeen> = unpack(TarReader(tar), manifest, prefix, Copier { f, data ->
+        val md = MessageDigest.getInstance("SHA-256")
+        sink.file(f, object : InputStream() {
+            override fun read(): Int {
+                val b = ByteArray(1)
+                return if (read(b, 0, 1) < 0) -1 else b[0].toInt() and 0xff
+            }
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                val n = data.read(b, off, len)
+                if (n > 0) md.update(b, off, n)
+                return n
+            }
+        })
+        Hashes.hex(md.digest())
+    }, progress)
+
+    /**
+     * The same from where [reader] stands (behind the manifest of a single
+     * pass, or at the start). Each listed member goes to [copier], which has to
+     * read it to its end; a member the manifest does not list, one listed twice,
+     * a wrong size, a wrong SHA-256 (when [copier] hashed) and a missing file
+     * end it. The reader refuses links and devices by itself.
+     */
+    fun unpack(
+        reader: TarReader,
+        manifest: OneiosManifest,
+        prefix: String,
+        copier: Copier,
+        progress: (Long) -> Unit = {},
     ): List<OneiosSeen> {
         val name = manifest.kind.manifestName
-        val reader = TarReader(tar)
         val seen = ArrayList<OneiosSeen>()
         val done = HashSet<String>()
         var bytes = 0L
@@ -700,11 +760,10 @@ object OneiosPackage {
             val want = manifest.file(path) ?: throw Problem("$path is not in $name")
             if (!done.add(path)) throw Problem("$path is in the file twice")
             if (e.size != want.size) throw Problem("$path is ${e.size} bytes, $name says ${want.size}")
-            val md = MessageDigest.getInstance("SHA-256")
             val raw = reader.data()
             val base = bytes
             var read = 0L
-            val hashing = object : InputStream() {
+            val counting = object : InputStream() {
                 override fun read(): Int {
                     val b = ByteArray(1)
                     return if (read(b, 0, 1) < 0) -1 else b[0].toInt() and 0xff
@@ -713,18 +772,18 @@ object OneiosPackage {
                 override fun read(b: ByteArray, off: Int, len: Int): Int {
                     val n = raw.read(b, off, len)
                     if (n > 0) {
-                        md.update(b, off, n)
                         read += n
                         progress(base + read)
                     }
                     return n
                 }
             }
-            sink.file(want, hashing)
+            val sha = copier.file(want, counting)
             if (read != want.size) throw Problem("$path was not read to its end")
-            val sha = Hashes.hex(md.digest())
-            if (sha != want.sha256) throw Problem("$path does not match its SHA-256 (${sha.take(12)}..., expected ${want.sha256.take(12)}...)")
-            seen += OneiosSeen(path, read, sha)
+            if (sha != null && sha != want.sha256) {
+                throw Problem("$path does not match its SHA-256 (${sha.take(12)}..., expected ${want.sha256.take(12)}...)")
+            }
+            seen += OneiosSeen(path, read, sha ?: want.sha256)
             bytes += read
         }
         val problems = OneiosManifests.verify(manifest, seen)

@@ -35,6 +35,7 @@
     <string name="oneios_tag_title">Which release?</string>
     <string name="oneios_tag_hint">Release tag (empty: the latest)</string>
     <string name="oneios_stop">Stop</string>
+    <string name="oneios_measuring">Starting…</string>
     <string name="oneios_not_this_phone">iOS 27 (OneiOS) is for the Galaxy S24 Ultra (SM-S928) only.</string>
     <string name="oneios_switch_confirm">One UI stops and iOS 27 starts. Hold Volume Up + Volume Down for 3 seconds to come back; if the screen stays black for long, One UI returns by itself, by a restart at worst.</string>
     <!-- Session logs (docs/oneios.md): what the iOS sessions left in the stage, read as root. -->
