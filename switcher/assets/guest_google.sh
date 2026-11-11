@@ -65,7 +65,7 @@ copy_app() { # <package> <name>
     plain_tree "$dir" || { WHY="a link below $dir"; return 1; }
     pm path "$pkg" 2>/dev/null | sed -n 's/^package://p' > "$CACHE/.$name.paths"
     [ -s "$CACHE/.$name.paths" ] || { WHY="$pkg is not installed in One UI"; return 1; }
-    : > "$CACHE/.$name.stat"
+    true > "$CACHE/.$name.stat"
     while IFS= read -r source; do
         case "$source" in
             /data/app/*/*.apk|/product/*/*.apk|/system/*/*.apk|/system_ext/*/*.apk) ;;
@@ -102,7 +102,7 @@ copy_app() { # <package> <name>
     # APKs without embedded arm64 libraries are valid too. Keep an explicit
     # empty manifest instead of passing an unmatched glob to sha256sum.
     (cd "$new" && sha256sum ./*.apk > apk.sha256 &&
-        : > native.sha256 &&
+        true > native.sha256 &&
         for f in lib/*.so lib/arm64/*.so; do
             [ -f "$f" ] || continue
             sha256sum "$f" >> native.sha256 || exit 1
@@ -224,7 +224,7 @@ prepare)
     done
     [ -n "$store" ] || say "the image keeps its own Play Store"
     remove_installed com.google.android.gms
-    : > "$CACHE/active"
+    true > "$CACHE/active"
     ;;
 *) echo "guest_google.sh: expected snapshot or prepare" >&2; exit 3 ;;
 esac

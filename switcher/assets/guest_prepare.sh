@@ -594,7 +594,7 @@ sec_ims_bind() {
         for f in "$SECIMS/$d"/*; do
             [ -f "$f" ] || continue
             t="$gse/$d/$(basename "$f")"
-            [ -e "$t" ] || : > "$t" || return 1
+            [ -e "$t" ] || true > "$t" || return 1
             $BB mount --bind "$f" "$t" || return 1
             $BB mount --make-rslave "$t" 2>/dev/null || true
             n=$((n + 1))
@@ -616,7 +616,7 @@ secims_mountpoints() {
         for f in "$SECIMS/$d"/*; do
             [ -f "$f" ] || continue
             [ -e "$GUEST_SYSTEM_EXT/$d/$(basename "$f")" ] && continue
-            mkdir -p "$up/$d" && : > "$up/$d/$(basename "$f")" || return 1
+            mkdir -p "$up/$d" && true > "$up/$d/$(basename "$f")" || return 1
         done
     done
     find "$up" -type d -exec chmod 755 {} + 2>/dev/null
@@ -857,7 +857,7 @@ samcam_mountpoints() {
     samcam_files | while read -r k t s; do
         [ "$k" = "$2" ] || continue
         if [ -d "$s" ]; then mkdir -p "$1/$t" || exit 1
-        else mkdir -p "$1/$(dirname "$t")" && : > "$1/$t" || exit 1
+        else mkdir -p "$1/$(dirname "$t")" && true > "$1/$t" || exit 1
         fi
     done || return 1
     find "$1" -type d -exec chmod 755 {} + 2>/dev/null
@@ -942,7 +942,7 @@ if [ -f "$STAGE/data/oneos_root/enabled" ] && [ ! -d "$ROOTFS/system/xbin" ]; th
             n=${e##*/}
             if [ -L "$e" ]; then cp -P "$e" "$GF/$n" || fok=0
             elif [ -d "$e" ]; then mkdir -p "$GF/$n" || fok=0
-            else : > "$GF/$n" || fok=0; fi
+            else true > "$GF/$n" || fok=0; fi
         done
         if [ $fok = 1 ]; then
             chmod 755 "$GF" "$GF/xbin"
@@ -1174,7 +1174,7 @@ if { [ -d /system_ext/apex ] && [ -d "$GUEST_SYSTEM_EXT" ]; } || [ $INJ = 1 ] ||
             SAMCAM=0; echo "Samsung Camera in the guest: off (no room for its mount points on the overlay's tmpfs)"
         fi
         if [ $HWSM = 1 ]; then
-            mkdir -p "$OV/up/bin" && : > "$OV/up/bin/hwservicemanager" &&
+            mkdir -p "$OV/up/bin" && true > "$OV/up/bin/hwservicemanager" &&
                 chmod 755 "$OV/up/bin" "$OV/up/bin/hwservicemanager" || HWSM=0
             $BB chcon u:object_r:system_file:s0 "$OV/up/bin" 2>/dev/null || true
             $BB chcon u:object_r:hwservicemanager_exec:s0 "$OV/up/bin/hwservicemanager" 2>/dev/null || true
@@ -1250,7 +1250,7 @@ if { [ -d /system_ext/apex ] && [ -d "$GUEST_SYSTEM_EXT" ]; } || [ $INJ = 1 ] ||
                 n=${e##*/}
                 if [ -L "$e" ]; then cp -P "$e" "$FARM/$n" || fok=0
                 elif [ -d "$e" ]; then mkdir -p "$FARM/$n" || fok=0
-                else : > "$FARM/$n" || fok=0; fi
+                else true > "$FARM/$n" || fok=0; fi
             done
             if [ $fok = 1 ]; then
                 chmod 755 "$FARM" "$FARM/apex"
@@ -1790,7 +1790,7 @@ if [ -e "$MIUI_FW/miui-services.jar" ] || [ -L "$MIUI_FW/miui-services.jar" ]; t
     XIMS="$MIUI_FW/xiaomi-opt-ims.jar"
     if [ "${ONEOS_GUEST_XIAOMI_IMS:-0}" != 1 ] && [ -f "$XIMS" ] && [ ! -L "$XIMS" ]; then
         rm -f "$STAGE/xiaomi-opt-ims.empty"
-        : > "$STAGE/xiaomi-opt-ims.empty" && chmod 644 "$STAGE/xiaomi-opt-ims.empty"
+        true > "$STAGE/xiaomi-opt-ims.empty" && chmod 644 "$STAGE/xiaomi-opt-ims.empty"
         $BB chcon u:object_r:system_file:s0 "$STAGE/xiaomi-opt-ims.empty" 2>/dev/null || true
         $BB umount -l "$XIMS" 2>/dev/null || true
         if $BB mount --bind "$STAGE/xiaomi-opt-ims.empty" "$XIMS" && [ ! -s "$XIMS" ]; then
@@ -2587,7 +2587,7 @@ fi
 # nothing links them. Hidden from the guest (vivo images; ONEOS_GUEST_MTK_FRAME_HOOKS=1
 # keeps them).
 if [ -e "$ROOTFS/system/framework/vivo-services.jar" ] && [ "${ONEOS_GUEST_MTK_FRAME_HOOKS:-0}" != 1 ]; then
-    : > "$STAGE/oneos_empty_lib" && chmod 644 "$STAGE/oneos_empty_lib"
+    true > "$STAGE/oneos_empty_lib" && chmod 644 "$STAGE/oneos_empty_lib"
     for l in libged_kpi.so libdisp_dejitter.so; do
         for d in "$GUEST_SYSTEM_EXT/lib64" "$GUEST_SYSTEM_EXT/lib"; do
             [ -f "$d/$l" ] && [ ! -L "$d/$l" ] || continue
@@ -4285,7 +4285,7 @@ esac
 exec /data/oneos_ksu/ksud.real "$@"
 KSUDWRAP
     chmod 755 "$KW/ksud"
-    : > "$KW/ksud.real" 2>/dev/null
+    true > "$KW/ksud.real" 2>/dev/null
     # ksud's module commands (list, install, uninstall, enable, disable, action)
     # first enter the mount namespace of pid 1, as format!("/proc/{}/ns/mnt", 1):
     # from a guest that is One UI's init, whatever namespace they were run in. In
@@ -4320,14 +4320,14 @@ KSUDWRAP
         for e in $(ls -A /data/adb 2>/dev/null); do
             case "$e" in modules|modules_update) continue ;; esac
             if [ "$e" = ksud ]; then
-                : > "$GA/ksud" && $BB mount --bind "$KW/ksud" "$GA/ksud" && $BB mount --make-private "$GA/ksud" || ok=0
+                true > "$GA/ksud" && $BB mount --bind "$KW/ksud" "$GA/ksud" && $BB mount --make-private "$GA/ksud" || ok=0
             elif [ -L "/data/adb/$e" ]; then
                 $BB cp -P "/data/adb/$e" "$GA/$e" 2>/dev/null
             elif [ -d "/data/adb/$e" ]; then
                 mkdir "$GA/$e" && $BB mount --bind "/data/adb/$e" "$GA/$e" && $BB mount --make-private "$GA/$e" &&
                     $BB mount -o remount,bind,ro "/data/adb/$e" "$GA/$e" || ok=0
             elif [ -f "/data/adb/$e" ]; then
-                : > "$GA/$e" && $BB mount --bind "/data/adb/$e" "$GA/$e" && $BB mount --make-private "$GA/$e" &&
+                true > "$GA/$e" && $BB mount --bind "/data/adb/$e" "$GA/$e" && $BB mount --make-private "$GA/$e" &&
                     $BB mount -o remount,bind,ro "/data/adb/$e" "$GA/$e" || ok=0
             fi
         done
@@ -5208,7 +5208,7 @@ bind_host_app() {
     [ -n "$3" ] && u=$(ls -d /data/app/*/"$3"-*/base.apk /data/app/"$3"-*/base.apk 2>/dev/null | head -n 1)
     if [ -n "$u" ] && [ "$($BB head -c 2 "$u" 2>/dev/null)" = PK ] && $BB unzip -l "$u" AndroidManifest.xml >/dev/null 2>&1 &&
        $BB mount -t tmpfs -o size=64k,mode=755 tmpfs "$2"; then
-        : > "$2/$(basename "$1").apk" && chmod 644 "$2/$(basename "$1").apk" &&
+        true > "$2/$(basename "$1").apk" && chmod 644 "$2/$(basename "$1").apk" &&
             $BB mount --bind "$u" "$2/$(basename "$1").apk" && $BB mount -o remount,ro "$2" 2>/dev/null &&
             { echo "Host $3 from One UI's update ($u) -> $2"; return 0; }
         $BB umount -l "$2" 2>/dev/null
@@ -5456,7 +5456,7 @@ if [ "$GMS_WANT" = 1 ]; then
     # Private at once: the stage sits on One UI's shared /data mount.
     $BB mount --make-private "$GMS_PKG" 2>/dev/null || gms_refuse "could not make $GMS_PKG private"
     echo "Google services: tmpfs package folder $GMS_PKG (label by $g_label)"
-    (cd "$GMS_PKG" && mkdir $GMS_SUB && chmod 755 $GMS_SUB) && : > "$GMS_PKG/$GMS_APK_NAME" &&
+    (cd "$GMS_PKG" && mkdir $GMS_SUB && chmod 755 $GMS_SUB) && true > "$GMS_PKG/$GMS_APK_NAME" &&
         chmod 644 "$GMS_PKG/$GMS_APK_NAME" ||
         gms_refuse "could not fill $GMS_PKG"
     if [ "$g_label" = chcon ]; then
@@ -5726,7 +5726,7 @@ mirror() {
     for e in $(ls -A "$a"); do
         if [ -L "$a/$e" ]; then $BB cp -P "$a/$e" "$t/$e"
         elif [ -d "$a/$e" ]; then mkdir "$t/$e" && $BB mount --rbind "$a/$e" "$t/$e"
-        else : > "$t/$e" && $BB mount --bind "$a/$e" "$t/$e"
+        else true > "$t/$e" && $BB mount --bind "$a/$e" "$t/$e"
         fi
     done
     # Private before anything goes on top: a bind of a /data file (a module's) is
@@ -5783,7 +5783,7 @@ for d in "$M"/*; do
                     rm -f "$tg"; $BB cp -P "$d/system/$rel" "$tg" && new=$((new + 1))
                 else
                     [ -L "$tg" ] && rm -f "$tg"
-                    : > "$tg" && $BB mount --bind "$d/system/$rel" "$tg" && $BB mount --make-private "$tg" && record "$tg" && new=$((new + 1)) || skipped=$((skipped + 1))
+                    true > "$tg" && $BB mount --bind "$d/system/$rel" "$tg" && $BB mount --make-private "$tg" && record "$tg" && new=$((new + 1)) || skipped=$((skipped + 1))
                 fi
             else
                 skipped=$((skipped + 1))

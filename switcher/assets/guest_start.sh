@@ -1831,7 +1831,7 @@ if [ "$DT2W" = 1 ] && command -v getevent >/dev/null 2>&1 && { [ -w /sys/class/s
             # The marker first: a chip that took the first write is in low-power mode,
             # whatever the second answers, and only a marked one is ever put back on
             # (here, by wake_tsp and by the return).
-            : > /data/oneos_dt2w_armed.$1
+            true > /data/oneos_dt2w_armed.$1
             if echo 1,0 > $T/enabled && echo 1,1 > $T/enabled; then
                 log "$1: $2: low-power mode (enabled=$(cat $T/enabled 2>/dev/null))"
             else

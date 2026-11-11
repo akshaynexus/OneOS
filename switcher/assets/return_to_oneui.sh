@@ -244,7 +244,7 @@ STAGE="$S" BB="$BB" /system/bin/sh "$S/fold8_coloros.sh" performance-restore || 
 KS=/data/local/tmp/oneos/return_keys
 if [ "$(cat "$KS/boot" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
     for p in $(cat "$KS/pids" 2>/dev/null); do
-        case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+        case "$(cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ')" in
             *oneos_switch.sh*) kill "$p" 2>/dev/null ;;
         esac
     done
@@ -593,7 +593,7 @@ fi
 #      framework waits on registered, nothing of the guest left.
 #   C  after: system_server keeps its pid until user 0 is unlocked and 30 s more.
 IPLOG=$S/return_inplace.log
-: > "$IPLOG"
+true > "$IPLOG"
 say() {
     m="$("$BB" date +%T) $*"
     echo "$m"; echo "$m" >> "$IPLOG"

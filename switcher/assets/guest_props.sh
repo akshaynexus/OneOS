@@ -1100,7 +1100,7 @@ add)
         cut -d= -f1 "$NEW" > "$ADDED"
     else
         # Older resetprop without -f: fall back to one call per prop.
-        : > "$ADDED"
+        true > "$ADDED"
         while IFS= read -r line; do
             "$RP" -n "${line%%=*}" "${line#*=}" 2>/dev/null && echo "${line%%=*}" >> "$ADDED"
         done < "$NEW"
@@ -1295,7 +1295,7 @@ remove)
         esac
     done < "$STAGE/guest_props.plan"
     getprop > "$NOWF"
-    : > "$BLANKED.new"
+    true > "$BLANKED.new"
     awk -v nf="$NOWF" '
         BEGIN { while ((getline l < nf) > 0) { i = index(l, "]: ["); if (substr(l, 1, 1) != "[" || i < 3) continue; v = substr(l, i + 4); sub(/\]$/, "", v); val[substr(l, 2, i - 2)] = v } }
         /^B / { k = substr($0, 3); print ((k in val) && val[k] == "" ? "E " : "S ") k }' "$STAGE/guest_props.plan" |
@@ -1466,7 +1466,7 @@ restore-persist)
     # With the session's own store (store-on) they were never in One UI's: blanked
     # in memory instead, so the next session writes into the same slots (listed
     # in guest_props.blanked, which the next snapshot leaves out).
-    : > "$BLANKED.persist"
+    true > "$BLANKED.persist"
     for key in $(cut -d= -f1 "$NOW"); do
         grep -q "^$key=" "$SNAP" && continue
         grep -qxF "$key=" "$NOW" && [ -f "$BLANKED" ] && grep -qxF "$key" "$BLANKED" && continue
@@ -1482,7 +1482,7 @@ restore-persist)
     fi
     rm -f "$BLANKED.persist"
     # Changed by the guest: put the host's value back, in storage too.
-    [ "$2" = "--added-only" ] && : > "$NOW.skip"
+    [ "$2" = "--added-only" ] && true > "$NOW.skip"
     while [ ! -f "$NOW.skip" ] && IFS= read -r line; do
         key=${line%%=*}
         grep -qxF "$line" "$NOW" && continue
