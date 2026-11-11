@@ -175,7 +175,7 @@ do_begin() {
     [ ! -L "$n" ] || refuse "$n is a link"
     rm -rf "$n" "$STAGE/$1.new.sha256" "$STAGE/$1.new.ids" || die "could not clear $n"
     mkdir "$n" && own "$n" 0700 || die "could not make $n"
-    : > "$STAGE/$1.new.sha256" && : > "$STAGE/$1.new.ids" && own "$STAGE/$1.new.sha256" 0600 && own "$STAGE/$1.new.ids" 0600 ||
+    true > "$STAGE/$1.new.sha256" && true > "$STAGE/$1.new.ids" && own "$STAGE/$1.new.sha256" 0600 && own "$STAGE/$1.new.ids" 0600 ||
         die "could not start the list"
     say "@@OK begin $1"
 }
@@ -427,8 +427,8 @@ check_cmd() { # <id>: TOOL (a file of the runtime's bin/), ARGS, LIMIT in second
 check_is_tool() { grep -q -F "$STAGE/runtime/bin/$TOOL" "/proc/$1/cmdline" 2>/dev/null; }
 # What a check may change, read before its tool runs.
 check_save() { # <id>
-    : > "$CHECKS/saved.backlight"
-    : > "$CHECKS/saved.als"
+    true > "$CHECKS/saved.backlight"
+    true > "$CHECKS/saved.als"
     case "$1" in
         levels)
             for d in "$T"/sys/class/backlight/*; do
@@ -477,8 +477,8 @@ check_restore() { # <id>
             [ -w "$n" ] && echo "$value" > "$n" && say "@@INFO put back: light sensor $name enable $value"
         done < "$CHECKS/saved.als"
     fi
-    : > "$CHECKS/saved.backlight"
-    : > "$CHECKS/saved.als"
+    true > "$CHECKS/saved.backlight"
+    true > "$CHECKS/saved.als"
     [ ! -e "$CHECKS/timeout" ] || unlink "$CHECKS/timeout"
 }
 checks_dir() {
@@ -508,7 +508,7 @@ do_check() {
     limit=$LIMIT
     if [ -n "$T" ] && is_dec "${ONEIOS_CHECK_LIMIT:-x}"; then limit=$ONEIOS_CHECK_LIMIT; fi
     log="$CHECKS/$id.log"
-    : > "$log"
+    true > "$log"
     [ ! -e "$CHECKS/timeout" ] || unlink "$CHECKS/timeout"
     [ ! -e "$CHECKS/$id.png" ] || unlink "$CHECKS/$id.png"
     check_save "$id"
@@ -519,7 +519,7 @@ do_check() {
     (
         sleep "$limit"
         check_is_tool "$pid" || exit 0
-        : > "$CHECKS/timeout"
+        true > "$CHECKS/timeout"
         kill -TERM "$pid" 2>/dev/null
         sleep 2
         check_is_tool "$pid" && kill -KILL "$pid" 2>/dev/null

@@ -10,8 +10,10 @@ restart. If that ever does nothing, **Power + Volume Down held until the phone r
 OneiOS is https://github.com/akshaynexus/OneiOS. Its plan is `docs/plan.md` there; the contract between this fork
 and its runtime is `oneos/interface.md` there ("session ABI 1"). This page is the fork's side.
 
-**Nothing here has run on a phone.** The app model, the root script and the stage checks are unit tested
-(below); the session past its preflight has never started, because no runtime with a working xnuhost exists yet.
+**On the phone so far** (the S24 Ultra, 2026-11-11, 0.4.76 to 0.4.79, runtime 0.1.6): the preflight, the zygote
+stop, the watchdog feeder and the in-place return ran, twice to One UI in 45 s. **xnuhost has never started
+there**, and one return stood still with a black screen; both causes are found and fixed in 0.4.81 ("What the
+first runs on the phone found", below). Everything after xnuhost's start is still unit tests only.
 
 ## Where its pieces come from
 
@@ -305,6 +307,12 @@ runtime with xnuhost is staged, this is where every switch ends.**
    is what the kernel ends when memory runs out:
    `/data/runtime/<xnuhost> --session-abi 1 --mode takeover --runtime /data/runtime --image /data/image --data /data/data --session /data/session`.
    If One UI's `/data` is still visible there, or `control` is writable there, it does not start.
+   From 0.4.81 the shell that sets this namespace up writes a line to `session/xnuhost.log` before each step
+   (`oneios inner: 08:12:21 making /data/runtime read-only`), and however it ends before xnuhost starts, its last
+   line is `oneios inner: ... ended with status N in step: ...`. The switch waits for it by its progress: until
+   it wrote xnuhost's pid, for as long as that shell runs (`control/inner.pid`), 30 s at most; a shell that ended
+   is not waited for. A shell still setting up when a return begins is ended by its pid, and it starts nothing if
+   the switch's state is no longer `starting`.
 5. The watcher returns to One UI when xnuhost ends, when `session/return.request` appears (the volume keys write
    it; xnuhost does when the guest asks; `adb` can), or when xnuhost has not created `session/ready` within
    600 s of its start (`ONEIOS_RETURN_MAX`; iOS never came up).
@@ -327,6 +335,13 @@ runtime with xnuhost is staged, this is where every switch ends.**
 4. **One UI's framework.** `vdc volume abort_fuse`, a fresh zygote_next, `ctl.restart netd` (whose own restart
    list starts zygote; `ctl.start zygote` otherwise).
 5. **Gate C.** system_server keeps its pid until user 0 is unlocked and 20 s more, within 180 s.
+
+**Every step has a time limit of its own** (0.4.81), kept by the return's guard, a process of its own: 90 s to
+stop the session, 45 s for Gate A, **75 s for Gate B**, 45 s to start One UI's zygote, 290 s for Gate C (its
+waits are 60 s, 180 s and 20 s). A step that stands still, on a command that never comes back, is rebooted out
+of at its limit (`GUARD: '[3/5] Gate B: ...' did not finish within 75s`), not after the guard's 600 s for the
+whole return. Gate B's waits for a service to register are by the clock (a `service check` that does not answer
+takes 3 s each time).
 
 A failed check anywhere is the failsafe: `sys.powerctl reboot,oneios-inplace-failsafe`, then Android's own
 `reboot`, then busybox's `reboot -f`, then sysrq. Busybox needs no reboot applet: KernelSU's has none, and from
@@ -413,6 +428,43 @@ readers, the poll or the gates reads anything of the boot screen's. It opens no 
 the only reader of the keys, and it does not grab), sets no property, holds no wakelock and stops no service.
 `ONEIOS_BOOTUI=0` (over adb) turns it off.
 
+## What the first runs on the phone found
+
+Three switches on the S24 Ultra on 2026-11-11 (07:24 with 0.4.76, 07:38 and 08:12 with 0.4.79), each ending
+`!!! xnuhost did not start`. The evidence: `switch.log`, `return.log`, the stage's listing, and the kernel log of
+the boot that was force-restarted (`/proc/last_kmsg`).
+
+**1. xnuhost never started, and from 0.4.79 the inner shell said nothing.** The shell that sets up xnuhost's
+namespace checked that `control/` is read-only there with `if : 2>/dev/null > /data/control/.w; then`. `:` is a
+*special builtin*, and Android's `sh` (mksh R59) ends the whole script when the redirection of a special builtin
+fails; with `2>/dev/null` before it, without a word, with status 1. So the check ended the shell exactly when it
+succeeded. On the phone: `sh -c 'if : 2>/dev/null > /proc/nonexistent/.w; then echo writable; fi; echo survived'`
+prints nothing and returns 1 (bash prints `survived`, which is why the PC's tests under bash never saw it, and
+the tests under mksh never ran this branch: it is behind the session). It fits the stage: `control/busybox` was
+copied at 08:12 (the step before the binds), no `session/xnuhost.pid`, an empty log, and no process left for the
+return to kill (the shell had exited, its namespace with it). In 0.4.76 the shell never got that far (busybox was
+hidden by the bind, fixed in 0.4.79). The 10 s wait was not too short: the shell was gone within a second.
+Reproduced on the PC with 0.4.79's script under mksh in a user and mount namespace: the same end. Fixed: no script redirects `:` any more (`true` is not a special builtin), in `oneios_switch.sh`,
+`oneios_return.sh` and `oneios_root.sh`; the trace and the wait by progress above.
+
+**2. The return of 08:12 stood still at Gate B** (`=== [3/5] Gate B ===` at 08:12:34, then nothing; a black
+screen until the owner's forced restart at 08:21). The kernel log shows init received no `ctl.restart` for the
+composer (its last control message is the switch's), and a process `tr` with pid 32734, 134 pids after the
+return's own 32600, **on a CPU** at 428 s, 516 s, 581 s and 593 s of uptime (the return began at 330 s). Gate B
+begins by waiting for the stop loop to end, asking each time whether its pid is still that script:
+`tr '\0' ' ' < /proc/PID/cmdline`. The stop loop ended in that moment (it had just been told to). A read of
+`/proc/PID/cmdline` whose process ended after the open fails with ESRCH, and **toybox 0.8.13's `tr` reads again
+for ever when a read fails**. On the phone, with a 3 s limit: `tr a b < /system` (EISDIR) and `tr` on the open
+cmdline of a `sleep` that ended both run into the limit (exit 124); `cat` ends with the error. It is a race, so
+the returns of 07:25 and 07:39 passed. Fixed: `cat PID/cmdline | tr` everywhere a cmdline is read (the return,
+the switch, and OneOS's `boot_status.sh`), so the read error ends `cat` and `tr` sees the end of a pipe; and the
+step limits above, so that anything else that stands still in Gate B is a reboot after 75 s, not a black phone
+for ten minutes.
+
+Also in that log, not this fork's doing but worth knowing: the phone's reset history
+(`/data/log/power_off_reset_reason.txt`) has two kernel panics between the sessions, at 07:49 and 08:02
+(`_raw_spin_trylock`, `usercopy_abort`), with One UI running and no session open.
+
 ## Getting back to One UI
 
 The way back is entirely on One UI's side. Nothing in it needs the guest to cooperate, to be responsive, or to
@@ -424,7 +476,7 @@ have started at all. From the fastest to the one that cannot fail:
 | 2 | The same chord from the keys' **state**: `getevent -pl` asks each device twice a second (EVIOCGKEY; a key that is down is marked `*`) | also when a program has grabbed the keys: a grab takes the events from other readers, not the state |
 | 3 | **The watcher**: returns on `session/return.request`, when xnuhost ends, when the switch never started it (60 s), when the guest never reported `ready` (600 s) | iOS crashed, never started, or asked to leave |
 | 4 | The key readers start the return themselves if the session is still not returning 5 s after their request | the watcher is gone or stuck |
-| 5 | **The return's guard**: a process of its own that reboots the phone if the return has not finished after 600 s; the watcher reboots at once if the return script cannot run or ends with an error | a step of the return hangs or the script is damaged |
+| 5 | **The return's guard**: a process of its own that reboots the phone if a step of the return has not finished within its own limit (75 s for Gate B; above), or the whole return after 600 s; the watcher reboots at once if the return script cannot run or ends with an error | a step of the return hangs or the script is damaged |
 | 6 | **The failsafe reboot** on any failed check of the return | anything about One UI's state is in doubt |
 | 7 | **Power + Volume Down, held until the phone restarts (about 7 s)** | always |
 
@@ -507,6 +559,17 @@ the two meet at the return's lock.
   come back, no system_server, a user that never unlocks), for a return that hangs (the guard) and for a
   return whose lock holder is gone. These are the scripts' logic, not the phone: `getevent`'s `*` mark, cgroup
   v2, the composer restart and the forced restart are still to be seen on the S24 Ultra.
+- **What the phone found** (0.4.81). `OneiosScriptTest`, under each shell: no script redirects `:`, and the
+  inner shell's read-only check goes on when the write fails; the trace's last line names the status and the
+  step; the inner shell's step lines come before each command of the setup, and the switch waits by its pid;
+  with a `tr` that never ends on an unreadable input (as toybox's), a stop loop and an inner shell whose cmdline
+  cannot be read do not stall the return, and no script lets `tr` read a `/proc` file itself; an inner shell
+  still setting up is ended by its pid; a composer restart that never comes back is a reboot at Gate B's limit
+  with the step named, and the limits (90, 45, 75, 45, 290 s) stay under the guard's 600 s. Not in the unit tests, run by
+  hand on the PC: the inner shell itself under mksh in a user and mount namespace (`unshare -Urm`, a stand-in
+  root with the stage, `chroot`): 0.4.79's script ends there as on the phone (status 1, an empty log,
+  `control/busybox` copied, no pid); 0.4.81's traces its fifteen steps and execs the runtime's xnuhost with the
+  stage as `/data`.
 - **The boot screen.** `OneiosScriptTest`, under each shell: root stages the three files in `bin/` and takes no
   other name; `boot_status.sh`'s `oneos_boot_begin ios` writes the title, the hint and the icon, and its
   supervisor in the `ios` mode starts the renderer with the bound, reads no Android boot event and ends on the
@@ -597,7 +660,8 @@ debug build too: Android guests that already hold upstream's release-signed one 
   state on One UI 8 without a permission (if not, it reads "off" and the row runs). The screen's layout was
   compiled, not seen.
 
-- **xnuhost does not exist yet.** The switch starts whatever the runtime package names, by the contract above;
+- **xnuhost has not started on the phone yet** (see "What the first runs on the phone found"). The switch
+  starts whatever the runtime package names, by the contract above;
   the booter's own interface on OneiOS's board (`docs/agents.md`) replaces that command line if it differs.
 - Nothing past the preflight has run on a phone: the zygote stop without a guest framework, the watchdog feeder,
   the wakelock, and the in-place return are written from OneOS's Android session and need their first run over

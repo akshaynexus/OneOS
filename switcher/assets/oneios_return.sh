@@ -19,6 +19,9 @@
 #      animation); audioserver and the rest of zygote's restart list; the
 #      services One UI's framework waits for are registered; zygote starts.
 #   C  system_server keeps its pid until user 0 is unlocked and 20 s more.
+# Never ":" with a redirection in this script or in oneios_switch.sh: ":" is a
+# special builtin, and Android's sh (mksh) ends the whole script, without a
+# word, when its redirection fails. "true" is not one.
 # Any failed check ends in failsafe(): a reboot, which is always a correct way
 # back (nothing of the session survives one, and nothing of One UI's was
 # written). A return that does not finish is rebooted by its guard.
@@ -72,6 +75,12 @@ WHO="${1:-manual}"
 # never comes back. Past this it reboots.
 GUARD_MAX=600
 [ -z "$T" ] || GUARD_MAX="${ONEIOS_TEST_GUARD_MAX:-$GUARD_MAX}"
+# Each step also has a limit of its own (step, below): 90 s to stop the
+# session, 45 s for Gate A, 75 s for Gate B, 45 s to start One UI's zygote,
+# 290 s for Gate C. (A test's clock runs faster than its commands: its limits
+# are that much longer.)
+STEP_K=1
+[ -z "$T" ] || STEP_K="${ONEIOS_TEST_STEP_K:-40}"
 
 [ -n "$T" ] || [ "$(id -u 2>/dev/null)" = 0 ] || { echo "oneios_return.sh: not root"; exit 2; }
 # The return must finish even if whatever started it goes away.
@@ -89,9 +98,12 @@ say() {
     echo "$m"
     [ $TEE = 0 ] || echo "$m" >> "$LOG"
 }
-step() {
-    echo "$*" 2>/dev/null > "$CTL/return.step"
-    say "=== $* ==="
+# A step and its own time limit in seconds (return.watch, for the guard): a
+# step that stands still is rebooted out of at its limit, not at the guard's.
+step() { # <title> <seconds>
+    echo "$1" 2>/dev/null > "$CTL/return.step"
+    echo "$(($2 * STEP_K)) $1" 2>/dev/null > "$CTL/return.watch"
+    say "=== $1 ==="
 }
 do_reboot() { # <reason word>
     # Nothing of the session's on the screen while the phone restarts.
@@ -128,7 +140,11 @@ put_back() {
 # Is this pid still one of our own shells? A pid file outlives its process and
 # ids are reused: nothing is signalled by a pid alone.
 is_ours() { # <pid> <script and mode words>
-    case "$(tr '\0' ' ' 2>/dev/null < "$P/$1/cmdline")" in *"$2"*) return 0 ;; esac
+    # cat, then tr: a process that ends between the open and the read makes the
+    # read fail (ESRCH), and toybox's tr reads again for ever on a failed read
+    # (the S24 Ultra, 2026-11-11: the stop loop ended just then, and Gate B
+    # stood still on this line with a black screen). cat ends on the error.
+    case "$(cat "$P/$1/cmdline" 2>/dev/null | tr '\0' ' ')" in *"$2"*) return 0 ;; esac
     return 1
 }
 # Ends one of oneios_switch.sh's helpers by its pid file.
@@ -165,7 +181,7 @@ bootui() { # <a function of boot_status.sh> [arguments]; never fails
 # every layer it had. Nothing of the return waits for it longer than 2 s.
 bootui_end() {
     [ -d "$BOOTUI" ] && [ ! -e "$BOOTUI/ended" ] || return 0
-    : 2>/dev/null > "$BOOTUI/stop"
+    true 2>/dev/null > "$BOOTUI/stop"
     echo "ended.$$" 2>/dev/null > "$BOOTUI/generation"
     bn=0
     while [ $bn -lt 10 ]; do
@@ -188,18 +204,19 @@ bootui_end() {
         [ -n "$bleft" ] || break
         sleep 0.2; bn=$((bn + 1))
     done
-    : 2>/dev/null > "$BOOTUI/ended"
+    true 2>/dev/null > "$BOOTUI/ended"
     if [ -n "$bleft" ]; then say "boot screen: still running after SIGKILL ($bleft): logged only, its layer goes with the composer restart"
     else say "boot screen: ended"; fi
     return 0
 }
+# By the clock: a "service check" that does not answer takes its 3 s each time.
 wait_found() { # <servicemanager name> <seconds>
-    w=0
-    while [ $w -lt $(($2 * 2)) ]; do
+    w0=$(now)
+    while :; do
         timeout 3 service check "$1" 2>/dev/null | grep -q ': found' && return 0
-        sleep 0.5; w=$((w + 1))
+        [ $(($(now) - w0)) -lt "$2" ] || return 1
+        sleep 0.5
     done
-    return 1
 }
 
 # --- THE GUARD -------------------------------------------------------------
@@ -212,10 +229,21 @@ wait_found() { # <servicemanager name> <seconds>
 if [ "$WHO" = --guard ]; then
     tok=$2
     [ -n "$tok" ] || exit 3
-    t=0
+    t=0 last="" in=0
     while [ $t -lt $GUARD_MAX ]; do
         [ "$(cat "$CTL/return.guard" 2>/dev/null)" = "$tok" ] || exit 0
-        sleep 5; t=$((t + 5))
+        # The step the return is in, and how long it has been in it.
+        cur=$(cat "$CTL/return.watch" 2>/dev/null)
+        if [ "$cur" = "$last" ]; then in=$((in + 2)); else last=$cur; in=0; fi
+        lim=${cur%% *}
+        case "$lim" in ''|*[!0-9]*) lim=0 ;; esac
+        if [ "$lim" -gt 0 ] && [ $in -ge "$lim" ]; then
+            [ "$(cat "$CTL/return.guard" 2>/dev/null)" = "$tok" ] || exit 0
+            say "GUARD: '${cur#* }' did not finish within ${lim}s - rebooting into One UI"
+            echo "failsafe $(date +%s) '${cur#* }' did not finish within ${lim}s" > "$S/return.outcome"
+            do_reboot oneios-return-guard
+        fi
+        sleep 2; t=$((t + 2))
     done
     [ "$(cat "$CTL/return.guard" 2>/dev/null)" = "$tok" ] || exit 0
     say "GUARD: the return did not finish within ${GUARD_MAX}s (last step: $(cat "$CTL/return.step" 2>/dev/null)) - rebooting into One UI"
@@ -223,7 +251,7 @@ if [ "$WHO" = --guard ]; then
     do_reboot oneios-return-guard
 fi
 
-: >> "$LOG"
+true >> "$LOG"
 say "=== Return to One UI ($WHO), session state '$(cat "$CTL/state" 2>/dev/null)', boot $(cat "$P/sys/kernel/random/boot_id" 2>/dev/null) ==="
 # The reboot return needs no session state and no lock.
 if [ "$WHO" = reboot ]; then
@@ -273,23 +301,26 @@ echo "$GTOK" > "$CTL/return.guard"
 if [ -n "$BB" ]; then "$BB" setsid $SH "$S/oneios_return.sh" --guard "$GTOK" </dev/null >/dev/null 2>&1 &
 else $SH "$S/oneios_return.sh" --guard "$GTOK" </dev/null >/dev/null 2>&1 & fi
 finished() { # the guard's mark and the lock go; the wakelocks are released
-    rm -f "$CTL/return.guard" "$CTL/return.step"
+    rm -f "$CTL/return.guard" "$CTL/return.step" "$CTL/return.watch"
     rm -rf "$CTL/returning.lock"
     echo oneios_session 2>/dev/null > "$T/sys/power/wake_unlock"
     echo oneios_return 2>/dev/null > "$T/sys/power/wake_unlock"
 }
 
-step "[1/5] Stopping the session"
+step "[1/5] Stopping the session" 90
 # The boot screen, while it is still up, says what happens now. The watcher
 # wrote its reason there already.
 bootui oneos_boot_write title 'Returning to One UI'
 [ "$WHO" = watcher ] || bootui oneos_boot_write status 'Stopping iOS'
 # The key readers and the watcher (unless this return is the watcher's own
 # child, or the watcher itself).
-: > "$CTL/keys/session" 2>/dev/null
+true 2>/dev/null > "$CTL/keys/session"
 end_readers
 wp=$(cat "$CTL/watcher.pid" 2>/dev/null)
 [ "$wp" = "$$" ] || [ "$wp" = "$PPID" ] || end_helper "$CTL/watcher.pid" --watch
+# The switch's inner shell, where it is still setting up xnuhost's namespace
+# (it has not bound the stage yet, so the mount tables below do not show it).
+end_helper "$CTL/inner.pid" --inner
 XP=$(cat "$CTL/xnuhost.pid" 2>/dev/null)
 XNS=$(cat "$CTL/mntns" 2>/dev/null)
 INIT_NS=$(readlink "$P/1/ns/mnt" 2>/dev/null)
@@ -382,8 +413,8 @@ done < "$CTL/base/backlight" 2>/dev/null
 # One UI never went away, so there is nothing to check or start. Its helpers
 # end, and that is the whole return.
 if [ ! -e "$CTL/stopped" ]; then
-    : > "$CTL/stop-loop.off"
-    : > "$CTL/feeder.off"
+    true > "$CTL/stop-loop.off"
+    true > "$CTL/feeder.off"
     end_helper "$CTL/stop-loop.pid" --stop-loop
     end_helper "$CTL/feeder.pid" --feed
     [ -z "$CG" ] || rmdir "$CG" 2>/dev/null
@@ -394,7 +425,7 @@ if [ ! -e "$CTL/stopped" ]; then
     exit 0
 fi
 
-step "[2/5] Gate A: nothing of the session is left"
+step "[2/5] Gate A: nothing of the session is left" 45
 left=$(session_left)
 [ -z "$left" ] || failsafe "processes still in the session's namespace or cgroup: $left"
 [ -z "$CG" ] || rmdir "$CG" 2>/dev/null || say "the session's cgroup $CG is empty but could not be removed (logged only)"
@@ -432,10 +463,10 @@ done
 changed=$(getprop | awk -F'\\]: \\[' 'NR == FNR { b[$1] = $2; next } $1 ~ /^\[persist\./ && (!($1 in b) || b[$1] != $2) { sub(/^\[/, "", $1); print $1 }' "$BASE/props" - 2>/dev/null | head -n 20 | tr '\n' ' ')
 say "Gate A: no session process, the stage mounted nowhere, vold, keystore2 and servicemanager as at the switch, SELinux $(getenforce 2>/dev/null); persist properties that differ from the switch: ${changed:-none}"
 
-step "[3/5] Gate B: One UI's display and services"
+step "[3/5] Gate B: One UI's display and services" 75
 # The stop loop must be gone before anything starts (its last ctl.stop can
 # land after a start; it also stops the boot animation).
-: > "$CTL/stop-loop.off"
+true > "$CTL/stop-loop.off"
 n=0
 while [ $n -lt 15 ]; do
     alive=0
@@ -552,7 +583,7 @@ for name in vold SurfaceFlinger media.audio_policy media.audio_flinger installd;
 done
 say "Gate B: display, audio and One UI's services up, SELinux $(getenforce 2>/dev/null)"
 
-step "[4/5] Starting One UI in place"
+step "[4/5] Starting One UI in place" 45
 # zygote's onrestart by hand: abort the FUSE connections the old framework left.
 timeout 10 vdc volume abort_fuse >/dev/null 2>&1
 # One UI's zygote_next ran through the session with the old framework's
@@ -575,7 +606,7 @@ while [ $n -lt 20 ] && [ "$(getprop init.svc.zygote)" != running ]; do sleep 0.5
 [ "$(getprop init.svc.zygote)" = running ] || failsafe "One UI's zygote did not start ($(getprop init.svc.zygote))"
 say "One UI's zygote started"
 
-step "[5/5] Gate C: One UI's system_server"
+step "[5/5] Gate C: One UI's system_server" 290
 # By the clock, not by counting rounds: one round's "am" alone takes a second.
 t0=$(now); t=0; ss=""
 while [ $t -lt 60 ]; do
@@ -587,7 +618,7 @@ done
 [ -n "$ss" ] || failsafe "One UI's system_server did not start in 60 s"
 say "One UI's system_server $ss"
 # system_server feeds Samsung's software watchdog again from here.
-: > "$CTL/feeder.off"
+true > "$CTL/feeder.off"
 t0=$(now); up=0
 while :; do
     sleep 2; t=$(($(now) - t0))

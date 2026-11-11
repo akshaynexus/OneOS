@@ -1480,6 +1480,143 @@ class OneiosScriptTest {
         for (never in listOf("failsafe", "exit ", "setprop", "do_reboot")) assertFalse("the boot screen's end has '$never'", end.contains(never))
     }
 
+    // --- What the first runs on the phone found (0.4.81) ----------------------------
+
+    /**
+     * Android's sh (mksh) ends a script, silently with `2>/dev/null`, when the redirection of a special builtin fails.
+     * `:` is one: the inner shell's check that control/ is read-only ended it every time the check succeeded, and
+     * xnuhost never started. No script here redirects `:`; the check goes on under every shell.
+     */
+    @Test
+    fun noScriptRedirectsTheColonBuiltin() = each { f ->
+        val colon = Regex("""(^|[;&|(]|\bthen|\bdo|\belse)\s*:\s+[^#]*>""")
+        for (s in listOf(switchScript, returnScript, rootScript)) {
+            val bad = code(s).filter { colon.containsMatchIn(it) }
+            assertTrue("${s.name} redirects ':': $bad", bad.isEmpty())
+        }
+        val boot = File(Shipped.switcherAssets, "boot_status.sh").readText()
+        val ios = boot.substring(boot.indexOf("if [ \"\$1\" = ios ]; then"), boot.indexOf("elif [ \"\$1\" = enter ]"))
+        assertFalse(ios, colon.containsMatchIn(ios))
+        // The check itself, as the inner shell has it, with a folder that cannot be written.
+        val probe = "if true 2>/dev/null > /data/control/.w; then"
+        assertTrue(code(switchScript).any { it.trim() == probe })
+        fun run(script: String): Pair<Int, String> {
+            val p = ProcessBuilder(f.sh, "-c", script).redirectErrorStream(true).start()
+            val out = p.inputStream.readBytes().toString(Charsets.UTF_8)
+            return p.waitFor() to out
+        }
+        val missing = File(f.root, "no-such-folder/.w").path
+        val (rc, out) = run("${probe.replace("/data/control/.w", missing)} echo writable; fi; echo went-on")
+        assertEquals(out, 0, rc)
+        assertEquals("went-on", out.trim())
+        // And the trace: a shell that ends before xnuhost starts says with what status and in which step.
+        val (rc2, out2) = run(
+            "AT=start; at() { AT=\$*; echo \"oneios inner: \$*\"; }; trap 'echo \"oneios inner: ended with status \$? in step: \$AT\"' EXIT; " +
+                "at 'checking that /data/control is read-only'; exit 70",
+        )
+        assertEquals(out2, 70, rc2)
+        assertTrue(out2, out2.trim().endsWith("oneios inner: ended with status 70 in step: checking that /data/control is read-only"))
+    }
+
+    /** The inner shell says each step before it takes it, and the switch waits for it by its progress. */
+    @Test
+    fun theInnerShellTracesItselfAndIsWaitedForByItsProgress() {
+        val sw = code(switchScript).joinToString("\n")
+        val inner = sw.substring(sw.indexOf("    --inner)"), sw.indexOf("    --stop-loop)"))
+        assertTrue(inner.contains("trap 'echo \"oneios inner: \$(date +%T) ended with status \$? in step: \$AT\"' EXIT"))
+        assertTrue(inner.contains("at() { AT=\$*; echo \"oneios inner: \$(date +%T) \$*\"; }"))
+        assertTrue(inner.indexOf("echo \$\$ 2>/dev/null > \"\$CTL/inner.pid\"") in 0 until inner.indexOf("cp \"\$BB\" \"\$CTL/busybox\""))
+        // A step line before every command of the setup that can fail or stand still.
+        val steps = listOf(
+            "at \"copying busybox to \$CTL/busybox\"" to "cp \"\$BB\" \"\$CTL/busybox\"",
+            "at \"making the mounts private\"" to "mount --make-rprivate /",
+            "at \"binding the stage over /data\"" to "mount --bind \"\$STAGE\" /data",
+            "at \"running busybox from the stage\"" to "\"\$BB\" true 2>/dev/null",
+            "at \"making /data/\$d read-only\"" to "mount -o remount,bind,ro",
+            "at \"checking that /data/control is read-only\"" to "> /data/control/.w",
+            "at \"checking that One UI's /data is not visible\"" to "[ ! -e /data/system ]",
+            "at \"session folders and the pid\"" to "echo \$\$ > /data/session/xnuhost.pid",
+            "at \"the session's cgroup\"" to "CG=/sys/fs/cgroup/oneios_session",
+        )
+        for ((say, cmd) in steps) assertTrue("$say before $cmd", inner.indexOf(say) in 0 until inner.indexOf(cmd))
+        // Nothing starts under a switch that gave up meanwhile; the trap stays for an exec that fails.
+        val exec = inner.indexOf("exec \"/data/runtime/\$R_XNUHOST\"")
+        assertTrue(inner.indexOf("[ \"\$(cat /data/control/state 2>/dev/null)\" = starting ] ||") in 0 until exec)
+        assertFalse(inner.contains("trap - EXIT"))
+        // The switch: until the pid is written, for as long as the inner shell runs, 30 s at most.
+        val session = sw.substring(sw.indexOf("echo \"=== [4/5]"))
+        val wait = session.substring(session.indexOf("unshare -m"), session.indexOf("XP=\$(cat \"\$SESSION/xnuhost.pid\""))
+        assertTrue(wait.contains("while [ \$n -lt 150 ] && [ ! -s \"\$SESSION/xnuhost.pid\" ]; do"))
+        assertTrue(wait.contains("[ -n \"\$ip\" ] && kill -0 \"\$ip\" 2>/dev/null || break"))
+        assertTrue(session.contains("the last lines of \$SESSION/xnuhost.log"))
+    }
+
+    /**
+     * toybox's tr reads again for ever when a read fails, and a read of /proc/PID/cmdline fails (ESRCH) when the
+     * process ended after the open: the return's Gate B stood still there, with a black screen, when the stop loop
+     * ended at that moment. No script lets tr read a /proc file itself, and a cmdline that cannot be read is no stall.
+     */
+    @Test
+    fun aCmdlineThatCannotBeReadDoesNotStallTheReturn() = each { f ->
+        for (s in listOf(switchScript, returnScript, rootScript, File(Shipped.switcherAssets, "boot_status.sh"))) {
+            val bad = code(s).filter { Regex("""\btr\b[^|]*<\s*"?(\${'$'}P|/proc)/""").containsMatchIn(it) }
+            assertTrue("${s.name}: tr reads a /proc file: $bad", bad.isEmpty())
+        }
+        assertTrue(code(returnScript).any { it.contains("case \"\$(cat \"\$P/\$1/cmdline\" 2>/dev/null | tr '\\0' ' ')\" in") })
+        f.phone()
+        // A tr like toybox's: it never ends when its input cannot be read (here: a folder).
+        val real = listOf("/usr/bin/tr", "/bin/tr").first { File(it).canExecute() }
+        f.file("bin/tr").apply {
+            writeText("#!/bin/sh\nif [ -d /proc/self/fd/0 ]; then n=0; while [ ! -e \"\$ONEIOS_TEST_ROOT/behave/unhang\" ] && [ \$n -lt 300 ]; do sleep 0.1; n=\$((n + 1)); done; exit 1; fi\nexec $real \"\$@\"\n")
+            setExecutable(true)
+        }
+        // The stop loop and a leftover inner shell, each gone between the open and the read of its cmdline.
+        for ((pid, file) in listOf(7200 to "stop-loop.pid", 7300 to "inner.pid")) {
+            val d = f.proc(pid, "sh")
+            File(d, "cmdline").delete()
+            File(d, "cmdline").mkdir()
+            File(f.control, file).writeText("$pid\n")
+        }
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        assertFalse(f.kills.toString(), f.kills.any { it.endsWith(" 7200") || it.endsWith(" 7300") })
+    }
+
+    /** An inner shell that is still setting up when the return begins is ended by its pid: it has no stage mount yet. */
+    @Test
+    fun theReturnEndsAnInnerShellThatIsStillSettingUp() = each { f ->
+        f.phone(state = "failed")
+        f.proc(7300, "sh", ns = "mnt:[80]", cmdline = "/system/bin/sh ${f.stage}/oneios_switch.sh --inner")
+        File(f.control, "inner.pid").writeText("7300\n")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(f.kills.toString(), f.kills.contains("-9 7300"))
+        assertFalse(f.file("proc/7300").exists())
+        f.assertInPlace(r.text)
+    }
+
+    /** A step that stands still is rebooted out of at its own limit (Gate B: 75 s), long before the guard's ten minutes. */
+    @Test
+    fun aStepThatStandsStillIsRebootedAtItsOwnLimit() = each { f ->
+        f.phone()
+        f.behave("hang_ctl.restart_$COMPOSER")
+        // (The test's clock runs 100 times faster than its commands: its limits are 4 times the phone's.)
+        val p = f.start("oneios_return.sh", "manual", env = mapOf("ONEIOS_TEST_STEP_K" to "4"), log = "log/return")
+        await("the guard's reboot", 60_000) { f.rebooted == "reboot,oneios-return-guard" }
+        assertTrue(p.isAlive)
+        val why = "'[3/5] Gate B: One UI's display and services' did not finish within 300s"
+        assertTrue(f.outcome, f.outcome.startsWith("failsafe ") && f.outcome.contains(why))
+        assertTrue(f.returnLog, f.returnLog.contains("GUARD: $why"))
+        assertFalse(f.returnLog, f.returnLog.contains("the return did not finish within"))
+        assertFalse(f.setprops.any { it == "ctl.restart netd" || it == "ctl.start zygote" })
+        // On the phone: every step has a limit, and all of them together stay under the guard's.
+        val ret = code(returnScript).joinToString("\n")
+        val limits = Regex("""(?m)^step "\[(\d)/5] [^"]*" (\d+)$""").findAll(ret).map { it.groupValues[1].toInt() to it.groupValues[2].toInt() }.toMap()
+        assertEquals(mapOf(1 to 90, 2 to 45, 3 to 75, 4 to 45, 5 to 290), limits)
+        assertTrue(limits.values.sum() < 600 && ret.contains("GUARD_MAX=600") && ret.contains("STEP_K=1"))
+    }
+
     // --- Hardware checks: the check runner, with stand-ins for OneiOS's tools ----------
 
     /** Stages a runtime whose bin/ holds [tools] (shell scripts standing in for OneiOS's phone tools). */

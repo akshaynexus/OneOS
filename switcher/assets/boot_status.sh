@@ -25,7 +25,9 @@ oneos_boot_ready() {
     read -r oneos_boot_pid oneos_boot_token < "$ONEOS_BOOT_DIR/ready" || return 1
     case "$oneos_boot_pid" in ''|*[!0-9]*) return 1;; esac
     [ "$oneos_boot_token" = "$(cat "$ONEOS_BOOT_DIR/generation" 2>/dev/null)" ] || return 1
-    tr '\0' ' ' 2>/dev/null < "/proc/$oneos_boot_pid/cmdline" | grep -q 'OneOSBootStatus' && kill -0 "$oneos_boot_pid" 2>/dev/null
+    # (cat, then tr: toybox's tr never ends on a failed read, and reading the
+    # cmdline of a process that just ended fails. docs/oneios.md, 0.4.81.)
+    cat "/proc/$oneos_boot_pid/cmdline" 2>/dev/null | tr '\0' ' ' | grep -q 'OneOSBootStatus' && kill -0 "$oneos_boot_pid" 2>/dev/null
 }
 # A cold renderer must post its first buffer before we choose a live handoff.
 # Never freeze its compositor while it is still initializing fonts/buffers.
@@ -72,7 +74,7 @@ oneos_boot_hold_display() {
     fi
     case "$composer_pid" in ''|*[!0-9]*) return 0;; esac
     # Refuse a stale init pid or an unrelated process.
-    case "$(tr '\0' ' ' 2>/dev/null < "/proc/$composer_pid/cmdline")" in
+    case "$(cat "/proc/$composer_pid/cmdline" 2>/dev/null | tr '\0' ' ')" in
         /vendor/bin/*composer*) ;;
         *) return 0;;
     esac
@@ -116,8 +118,8 @@ oneos_boot_begin() {
         # No Android framework follows: the status line is always shown (the
         # switch writes the boot stage it reads in xnuhost's log), with the
         # way back under it. The title is plain text; the icon is OneOS's.
-        : > "$ONEOS_BOOT_DIR/events.log"
-        : > "$ONEOS_BOOT_DIR/renderer.log"
+        true > "$ONEOS_BOOT_DIR/events.log"
+        true > "$ONEOS_BOOT_DIR/renderer.log"
         oneos_boot_write verbose 1
         oneos_boot_write system_name 'iOS 27'
         oneos_boot_write title 'Starting iOS 27'
@@ -215,7 +217,7 @@ if [ "${1:-}" = supervise ]; then
     fi
     stop_worker() {
         [ -n "${worker:-}" ] || return 0
-        case "$(tr '\0' ' ' 2>/dev/null < "/proc/$worker/cmdline")" in
+        case "$(cat "/proc/$worker/cmdline" 2>/dev/null | tr '\0' ' ')" in
             *"OneOSBootStatus $ONEOS_BOOT_DIR $generation"*) kill "$worker" 2>/dev/null ;;
         esac
     }

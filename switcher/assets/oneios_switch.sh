@@ -144,7 +144,9 @@ reader_end() {
 # drops a dead client's layers, and the return restarts the composer anyway.
 end_display() {
     for dp in $(cat "$CTL/display.pid" 2>/dev/null); do
-        case "$(tr '\0' ' ' 2>/dev/null < "$P/$dp/cmdline")" in
+        # (cat, then tr: toybox's tr never ends on a failed read, and a read of
+        # the cmdline of a process that just ended fails. oneios_return.sh.)
+        case "$(cat "$P/$dp/cmdline" 2>/dev/null | tr '\0' ' ')" in
             *OneiOSDisplay*|*oneios-display*) kill -9 "$dp" 2>/dev/null ;;
         esac
     done
@@ -274,7 +276,7 @@ why_ended() {
 # boot screen is taken away under it.
 display_up() {
     for dp in $(cat "$CTL/display.pid" 2>/dev/null); do
-        case "$(tr '\0' ' ' 2>/dev/null < "$P/$dp/cmdline")" in
+        case "$(cat "$P/$dp/cmdline" 2>/dev/null | tr '\0' ' ')" in
             *OneiOSDisplay*|*oneios-display*) ;;
             *) continue ;;
         esac
@@ -410,7 +412,20 @@ case "$MODE" in
         # Inside the new mount namespace (unshare -m), still root. The stage
         # becomes /data: nothing else of One UI's /data exists in here.
         [ -z "$T" ] || exit 3
+        # Every step says so in xnuhost's log before it is taken, and however
+        # this shell ends before xnuhost starts, its last line says with what
+        # status and in which step. (The S24 Ultra, 2026-11-11, 0.4.77 to
+        # 0.4.80: it ended here without a word, in the check that control/ is
+        # read-only. That check wrote with ":", a special builtin, and
+        # Android's sh ends the script when a special builtin's redirection
+        # fails; with 2>/dev/null before it, silently. The check succeeded,
+        # and that was the end. Never ":" with a redirection: "true".)
+        AT="start"
+        at() { AT=$*; echo "oneios inner: $(date +%T) $*"; }
+        trap 'echo "oneios inner: $(date +%T) ended with status $? in step: $AT"' EXIT
         die_inner() { echo "oneios inner: $*"; exit 70; }
+        echo $$ 2>/dev/null > "$CTL/inner.pid"
+        at "pid $$, mount namespace $(readlink /proc/$$/ns/mnt 2>/dev/null)"
         R_XNUHOST=$(conf "$STAGE/runtime.conf" xnuhost)
         [ -n "$BB" ] && [ -x "$BB" ] || die_inner "no busybox"
         [ "$(readlink /proc/$$/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ] || die_inner "still in init's mount namespace"
@@ -418,26 +433,34 @@ case "$MODE" in
         # this namespace's setup runs a copy in the way back's control folder (root's, read-only in here), as
         # OneOS's guest_prepare.sh copies busybox into the guest's /data. It keeps the name busybox (a
         # multi-call busybox goes by its name).
+        at "copying busybox to $CTL/busybox"
         cp "$BB" "$CTL/busybox" && chmod 0700 "$CTL/busybox" || die_inner "could not copy $BB to $CTL/busybox"
+        at "making the mounts private"
         "$BB" mount --make-rprivate / || die_inner "could not make the mounts private"
+        at "binding the stage over /data"
         "$BB" mount --bind "$STAGE" /data || die_inner "could not bind the stage over /data"
         BB=/data/control/busybox
+        at "running busybox from the stage"
         "$BB" true 2>/dev/null || die_inner "busybox does not run from the stage ($BB)"
         # Read-only in here: the runtime and the image (as staged), and what
         # the way back runs and reads (its scripts, its control folder).
         for d in runtime image control bin oneios_switch.sh oneios_return.sh; do
             [ -e "/data/$d" ] || continue
+            at "making /data/$d read-only"
             "$BB" mount --bind "/data/$d" "/data/$d" && "$BB" mount -o remount,bind,ro "/data/$d" ||
                 die_inner "could not make /data/$d read-only"
         done
-        if : 2>/dev/null > /data/control/.w; then
+        at "checking that /data/control is read-only"
+        if true 2>/dev/null > /data/control/.w; then
             rm -f /data/control/.w
             die_inner "the way back's control folder is writable in the session's namespace"
         fi
         # The guard this session rests on: One UI's data is not reachable here.
+        at "checking that One UI's /data is not visible"
         [ ! -e /data/system ] && [ ! -e /data/misc ] && [ ! -e /data/user ] && [ -f /data/runtime.conf ] ||
             die_inner "One UI's /data is still visible in the session's namespace"
         cd /data || die_inner "cd /data"
+        at "session folders and the pid"
         mkdir -p /data/data /data/session/tmp && chmod 0700 /data/data /data/session/tmp || die_inner "could not make /data/data"
         echo $$ > /data/session/xnuhost.pid || die_inner "could not write the pid"
         # A cgroup of its own for xnuhost and everything it starts (cgroup v2,
@@ -446,6 +469,7 @@ case "$MODE" in
         # whole group at once (cgroup.kill) wherever a task of it went. Without
         # cgroup v2 (its root has cgroup.controllers) the return has the mount
         # namespace alone, as before.
+        at "the session's cgroup"
         CG=/sys/fs/cgroup/oneios_session
         if [ -f /sys/fs/cgroup/cgroup.controllers ] && mkdir -p "$CG" 2>/dev/null && echo $$ > "$CG/cgroup.procs" 2>/dev/null; then
             echo "oneios inner: cgroup $CG"
@@ -459,6 +483,11 @@ case "$MODE" in
         export ONEIOS_SESSION_ABI=$ABI ONEIOS_MODE=takeover ONEIOS_RUNTIME=/data/runtime ONEIOS_IMAGE=/data/image \
                ONEIOS_DATA=/data/data ONEIOS_SESSION=/data/session TMPDIR=/data/session/tmp
         unset BB ONEIOS_APP ONEIOS_TEST_ROOT
+        # A switch that gave up on this shell meanwhile is returning to One
+        # UI: nothing starts under it.
+        [ "$(cat /data/control/state 2>/dev/null)" = starting ] ||
+            die_inner "the switch is no longer starting (state '$(cat /data/control/state 2>/dev/null)'): xnuhost is not started"
+        AT="exec of /data/runtime/$R_XNUHOST"
         echo "oneios inner: $(date '+%F %T') starting /data/runtime/$R_XNUHOST (pid $$)"
         exec "/data/runtime/$R_XNUHOST" --session-abi $ABI --mode takeover \
             --runtime /data/runtime --image /data/image --data /data/data --session /data/session
@@ -605,7 +634,7 @@ case "$MODE" in
                       [ "$(cat "$KS/up" 2>/dev/null)" = DOWN ] && [ "$(cat "$KS/down" 2>/dev/null)" = DOWN ] &&
                       ask_return "keys: Volume Up + Volume Down held 3 s" ) &
             else
-                : > "$KS/both"
+                true > "$KS/both"
             fi
         done
         exit 0
@@ -835,7 +864,7 @@ ls -1t "$STAGE/logs"/xnuhost-*.log 2>/dev/null | tail -n +6 | while read -r old;
 rm -rf "$SESSION" "$CTL"
 mkdir -p "$CTL/base" "$CTL/keys" "$SESSION/tmp" "$STAGE/data" && chown -R 0:0 "$SESSION" "$CTL" && chmod -R go-rwx "$SESSION" "$CTL" &&
     chmod 0700 "$STAGE/data" || refuse "could not make $SESSION"
-: > "$SESSION/xnuhost.log"
+true > "$SESSION/xnuhost.log"
 boot_id > "$CTL/boot"
 echo starting > "$CTL/state"
 # What the in-place return compares against (oneios_return.sh), read while
@@ -937,12 +966,21 @@ screen status "Starting xnuhost"
 # A new mount namespace made from init's; --inner binds the stage over /data
 # there and execs xnuhost, so the pid it writes is xnuhost's own.
 "$BB" setsid "$BB" unshare -m /system/bin/sh "$SELF" --inner </dev/null >>"$SESSION/xnuhost.log" 2>&1 &
+# Waited for by its progress, not for a fixed time: until it wrote the pid, for
+# as long as that shell runs (control/inner.pid), 30 s at most. A shell that
+# ended is not waited for; its trace in the log says where it stopped.
 n=0
-while [ $n -lt 50 ] && [ ! -s "$SESSION/xnuhost.pid" ]; do sleep 0.2; n=$((n + 1)); done
+while [ $n -lt 150 ] && [ ! -s "$SESSION/xnuhost.pid" ]; do
+    if [ $n -ge 10 ]; then
+        ip=$(cat "$CTL/inner.pid" 2>/dev/null)
+        [ -n "$ip" ] && kill -0 "$ip" 2>/dev/null || break
+    fi
+    sleep 0.2; n=$((n + 1))
+done
 XP=$(cat "$SESSION/xnuhost.pid" 2>/dev/null)
 XNS=$(readlink "/proc/$XP/ns/mnt" 2>/dev/null)
 if [ -z "$XP" ] || [ -z "$XNS" ] || [ "$XNS" = "$INIT_NS" ]; then
-    echo "!!! xnuhost did not start (pid '${XP}', namespace '${XNS}'): $(tail -n 5 "$SESSION/xnuhost.log" | tr '\n' '|')"
+    echo "!!! xnuhost did not start after $((n / 5)) s (pid '${XP}', namespace '${XNS}'); the last lines of $SESSION/xnuhost.log: $(tail -n 6 "$SESSION/xnuhost.log" | tr '\n' '|')"
     screen status "xnuhost did not start: $(grep . "$SESSION/xnuhost.log" 2>/dev/null | tail -n 1)"
     echo failed > "$CTL/state"
     # The watcher sees the state and returns; nothing else to undo here.
