@@ -135,7 +135,13 @@ case "$me" in
             case "$sig" in
                 0) continue ;;
                 TERM) [ -e "$T/proc/$p/ignore_term" ] && continue ;;
-                KILL) [ -e "$T/proc/$p/unkillable" ] && continue ;;
+                KILL) [ -e "$T/proc/$p/unkillable" ] && continue
+                    # kills_left N: a process that ends only at the Nth SIGKILL (one that leaves
+                    # an uninterruptible system call late, as on the phone on 2026-11-12)
+                    if [ -f "$T/proc/$p/kills_left" ]; then
+                        n=$(($(cat "$T/proc/$p/kills_left") - 1))
+                        [ $n -le 0 ] || { echo $n > "$T/proc/$p/kills_left"; continue; }
+                    fi ;;
             esac
             # Its tasks die with it (PR_SET_PDEATHSIG), unless they cannot.
             for c in $(cat "$T/proc/$p/children" 2>/dev/null) "$p"; do

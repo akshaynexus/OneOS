@@ -470,7 +470,29 @@ if [ ! -e "$CTL/stopped" ] && ! framework_down; then
 fi
 
 step "[2/5] Gate A: nothing of the session is left" 45
+# A process killed in the stop above ends only when it leaves the kernel: one
+# that is inside a system call that cannot be interrupted (state D: the exit of
+# a large GPU or memory mapping on a host short of memory) can take seconds.
+# Phone, 2026-11-12 23:15: pid 20113 was still there 1 s after the last of the
+# five SIGKILL rounds, Gate A looked once, and the failsafe restarted the phone.
+# Wait up to 30 s of the step's 45 for those pids, with the cgroup killed and
+# each pid killed again every second; say once what each one is (only its own
+# /proc/PID files: comm, the state field, wchan), so the next log names it.
 left=$(session_left)
+if [ -n "$left" ]; then
+    for p in $left; do
+        st=$(awk '{ print $3 }' "$P/$p/stat" 2>/dev/null)
+        say "Gate A: $p still there after SIGKILL: $(cat "$P/$p/comm" 2>/dev/null) state ${st:-?} wchan $(cat "$P/$p/wchan" 2>/dev/null): waiting up to 30 s for it to end"
+    done
+    t0=$(now)
+    while [ -n "$left" ] && [ $(($(now) - t0)) -lt 30 ]; do
+        [ -n "$CG" ] && [ -e "$CG/cgroup.kill" ] && echo 1 > "$CG/cgroup.kill" 2>/dev/null
+        for p in $left; do kill -9 "$p" 2>/dev/null; done
+        sleep 1
+        left=$(session_left)
+    done
+    [ -n "$left" ] || say "Gate A: the killed processes ended after $(($(now) - t0)) s"
+fi
 [ -z "$left" ] || failsafe "processes still in the session's namespace or cgroup: $left"
 [ -z "$CG" ] || rmdir "$CG" 2>/dev/null || say "the session's cgroup $CG is empty but could not be removed (logged only)"
 [ -f "$BASE/boot_id" ] || failsafe "no baseline of the switch ($BASE)"

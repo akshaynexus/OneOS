@@ -1138,6 +1138,18 @@ class OneiosScriptTest {
     }
 
     @Test
+    fun aProcessThatEndsLateAfterSigkillIsWaitedForAtGateA() = each { f ->
+        // Phone, 2026-11-12 23:15: a killed task outlived the stop's five SIGKILL rounds, Gate A looked once and the
+        // failsafe restarted the phone. It ends at the 8th SIGKILL here: within Gate A's wait, so One UI comes back in place.
+        f.phone()
+        File(f.guest(5001, "xnuhost-tasks"), "kills_left").writeText("8\n")
+        val r = f.returns()
+        assertTrue(r.text, r.text.contains("Gate A: 5001 still there after SIGKILL: xnuhost-tasks"))
+        assertTrue(r.text, r.text.contains("Gate A: the killed processes ended after"))
+        f.assertInPlace(r.text)
+    }
+
+    @Test
     fun aProcessThatCannotBeKilledIsAReboot() = failsafe("processes still in the session's namespace or cgroup: 5001") { f ->
         File(f.guest(5001, "xnuhost-tasks"), "unkillable").createNewFile()
     }

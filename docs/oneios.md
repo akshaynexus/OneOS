@@ -347,7 +347,7 @@ runtime with xnuhost is staged, this is where every switch ends.**
    in the reverse order of the switch's writes: `clocks: NODE NOW -> OLD (One UI's)` in `return.log`, also after
    a SIGKILL of xnuhost (the return runs on every way back but the reboot, which resets them anyway). Only those
    nodes and only numbers; a node that cannot be written is logged and does not stop the return.
-2. **Gate A.** No such process is left; the stage is mounted in no process's mount table (every namespace, not
+2. **Gate A.** No such process is left (a killed one that is still in the kernel gets up to 30 s of the gate's 45, killed again every second; each one is logged once with its `comm`, state and `wchan`, from its own `/proc/PID` files); the stage is mounted in no process's mount table (every namespace, not
    only init's: OneOS's run 45); nothing was mounted on One UI's partitions; the same boot; vold, keystore2 and
    servicemanager have their pids of the switch; the daemons One UI cannot restart are running; SELinux is as
    it was. Persist properties that differ from the switch are logged by name (the scripts set none).
@@ -533,7 +533,7 @@ as on a clean exit, so nothing has to be released by xnuhost. What can be left i
 that last saw another DRM master, a surfaceflinger whose GPU context a guest fault reset or that is stuck in a
 call), which is why the return never trusts the old display state: it always restarts the composer and
 surfaceflinger and requires both back. A GPU that does not recover fails those checks, or Gate C, and ends in
-the reboot. A process the kernel cannot end (stuck in a driver) fails Gate A: reboot.
+the reboot. A process the kernel cannot end (stuck in a driver) fails Gate A after its 30 s wait: reboot. (Phone, 2026-11-12 23:15: Gate A looked once, 1 s after the last SIGKILL, and a task that was still ending made it reboot; the wait is for that case.)
 
 Not ported from OneOS's return: holding the composer (`oneos_boot_hold_display`). It keeps the return splash's
 last frame on the panel while no surfaceflinger exists; an iOS session's boot screen is ended before the gates
