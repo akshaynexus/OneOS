@@ -299,8 +299,13 @@ runtime with xnuhost is staged, this is where every switch ends.**
 
 1. Session folder, control folder and baseline: boot id, SELinux mode, properties, the pids of vold, keystore2,
    surfaceflinger and servicemanager, init's mount points, the panel's brightness, and **One UI's clock caps**
-   (`control/base/clocks`: each node, One UI's value, the session's): `scaling_min_freq` and `scaling_max_freq` of
-   every cpufreq policy, `/sys/kernel/gpu/gpu_max_clock` and KGSL's `max_gpuclk`. One UI (Samsung's SSRM in
+   (`control/base/clocks`: each node, One UI's value, the session's): Samsung's `cpufreq_limit`
+   (`/sys/devices/system/cpu/cpufreq_limit/cpufreq_max_limit` and `cpufreq_min_limit`, `drivers/cpufreq/cpufreq_limit.c`
+   of the SM8650 kernel: SSRM's one value for every cluster, a freq QoS request of its own, so `scaling_max_freq`
+   alone does not lift it; `-1` releases it), `scaling_min_freq` and `scaling_max_freq` of every cpufreq policy,
+   `/sys/kernel/gpu/gpu_max_clock` and KGSL's `max_gpuclk`. The first phone run (0.4.87's scripts, 2026-11-12) lifted
+   the GPU (500 -> 1000 MHz) but not the CPUs: their `scaling_max_freq` read 1689600/2035200 after the write, the
+   `cpufreq_limit` cap. One UI (Samsung's SSRM in
    system_server) caps them when the phone is warm and its power HAL raises the floors in bursts; with
    system_server stopped, its last values stayed for the whole session (1.7-2.0 GHz CPUs and a 500 MHz GPU after a
    warm One UI, the S24 Ultra, 2026-11-12). `switch.log`: `Clocks of One UI: ...`.
@@ -310,8 +315,8 @@ runtime with xnuhost is staged, this is where every switch ends.**
    of them run and the wakelock is held**; if not, the switch ends there.
 3. The boot screen starts (below), then One UI's zygote and zygote_secondary are stopped, so system_server and
    every app end; a loop keeps them stopped. surfaceflinger, the vendor composer, audioserver, netd, vold, keystore2 and the radio keep running.
-   Once system_server is gone the switch marks `control/clocks.set` and writes the hardware's range into those
-   nodes (`cpuinfo_min_freq`, `cpuinfo_max_freq`, the top of `gpu_freq_table` and `gpu_available_frequencies`),
+   Once system_server is gone the switch marks `control/clocks.set`, releases `cpufreq_limit` (`-1`, first), and
+   writes the hardware's range into the other nodes (`cpuinfo_min_freq`, `cpuinfo_max_freq`, the top of `gpu_freq_table` and `gpu_available_frequencies`),
    one line each in `switch.log`: `clocks: NODE OLD -> NEW (reads N)`. The kernel's thermal zones, trips and
    cooling devices are never written, nor anything under `/sys/power` but the wakelock: the kernel's junction
    trips, LMh and xnuhost's own thermal step (OneiOS `runtime/bridges/thermal`) are what cap a session.

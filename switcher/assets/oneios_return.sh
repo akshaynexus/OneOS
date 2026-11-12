@@ -424,9 +424,10 @@ done < "$CTL/base/backlight" 2>/dev/null
 # node that cannot be written is logged and never stops the return.
 if [ -e "$CTL/clocks.set" ]; then
     awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' "$CTL/base/clocks" 2>/dev/null | while read -r node old new; do
-        case "$node" in /sys/devices/system/cpu/cpufreq/policy*/scaling_m??_freq|/sys/kernel/gpu/gpu_max_clock|/sys/class/kgsl/kgsl-3d0/max_gpuclk) ;; *) continue ;; esac
+        case "$node" in /sys/devices/system/cpu/cpufreq/policy*/scaling_m??_freq|/sys/kernel/gpu/gpu_max_clock|/sys/class/kgsl/kgsl-3d0/max_gpuclk) ;;
+            /sys/devices/system/cpu/cpufreq_limit/cpufreq_max_limit|/sys/devices/system/cpu/cpufreq_limit/cpufreq_min_limit) ;; *) continue ;; esac
         case "$node" in *..*) continue ;; esac
-        case "$old" in ''|*[!0-9]*) continue ;; esac
+        case "${old#-}" in ''|*[!0-9]*) continue ;; esac
         was=$(cat "$T$node" 2>/dev/null)
         if echo "$old" > "$T$node" 2>/dev/null; then say "clocks: $node $was -> $old (One UI's)"; else say "clocks: $node could not be written back to $old (logged only)"; fi
     done

@@ -433,6 +433,14 @@ clock_top() { # <list of numbers>: the largest
 clocks_save() {
     out="$CTL/base/clocks"
     true > "$out"
+    # Samsung's cpufreq_limit (drivers/cpufreq/cpufreq_limit.c of the SM8650 kernel): SSRM's one value for every
+    # cluster, held as a freq QoS request of its own above scaling_max_freq and scaling_min_freq (so a write there
+    # does not lift it: the phone, 2026-11-12, 2035200 kept); -1 releases it. First in the file: released first,
+    # put back last.
+    for n in cpufreq_max_limit cpufreq_min_limit; do
+        v=$(cat "$T/sys/devices/system/cpu/cpufreq_limit/$n" 2>/dev/null)
+        case "${v#-}" in ''|*[!0-9]*) ;; *) echo "/sys/devices/system/cpu/cpufreq_limit/$n $v -1" >> "$out" ;; esac
+    done
     for pol in "$T"/sys/devices/system/cpu/cpufreq/policy*; do
         [ -d "$pol" ] || continue
         lo=$(cat "$pol/cpuinfo_min_freq" 2>/dev/null); hi=$(cat "$pol/cpuinfo_max_freq" 2>/dev/null)
@@ -455,14 +463,17 @@ clocks_tops() {
     # The mark first: from here the return writes One UI's values back.
     echo "$(date +%s)" > "$CTL/clocks.set"
     while read -r node old new; do
-        case "$node" in /sys/devices/system/cpu/cpufreq/policy*/scaling_m??_freq|/sys/kernel/gpu/gpu_max_clock|/sys/class/kgsl/kgsl-3d0/max_gpuclk) ;; *) continue ;; esac
-        case "$old$new" in ''|*[!0-9]*) continue ;; esac
+        case "$node" in /sys/devices/system/cpu/cpufreq/policy*/scaling_m??_freq|/sys/kernel/gpu/gpu_max_clock|/sys/class/kgsl/kgsl-3d0/max_gpuclk) ;;
+            /sys/devices/system/cpu/cpufreq_limit/cpufreq_max_limit|/sys/devices/system/cpu/cpufreq_limit/cpufreq_min_limit) ;; *) continue ;; esac
+        case "${old#-}${new#-}" in ''|*[!0-9]*) continue ;; esac
         if echo "$new" > "$T$node" 2>/dev/null; then
             echo "clocks: $node $old -> $new (reads $(cat "$T$node" 2>/dev/null))"
         else
             echo "clocks: $node $old -> $new not written (left at $(cat "$T$node" 2>/dev/null))"
         fi
     done < "$CTL/base/clocks"
+    l="$T/sys/devices/system/cpu/cpufreq_limit/limit_stat"
+    [ ! -e "$l" ] || echo "clocks: cpufreq_limit limit_stat: $(awk '{ printf "%s ", $0 }' "$l" 2>/dev/null | cut -c1-300)"
     k="$T/sys/class/kgsl/kgsl-3d0"
     [ ! -e "$k/thermal_pwrlevel" ] || echo "clocks: KGSL thermal_pwrlevel $(cat "$k/thermal_pwrlevel" 2>/dev/null), max_gpuclk $(cat "$k/max_gpuclk" 2>/dev/null)"
 }

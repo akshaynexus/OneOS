@@ -960,6 +960,11 @@ class OneiosScriptTest {
             node("$cpu/policy${p[0]}/cpuinfo_min_freq", p[1]); node("$cpu/policy${p[0]}/cpuinfo_max_freq", p[2])
             node("$cpu/policy${p[0]}/scaling_min_freq", p[3]); node("$cpu/policy${p[0]}/scaling_max_freq", p[4])
         }
+        // Samsung's cpufreq_limit: SSRM's one cap for every cluster, its own QoS request above scaling_max_freq; -1 is none.
+        val lim = "sys/devices/system/cpu/cpufreq_limit"
+        node("$lim/cpufreq_max_limit", "2035200")
+        node("$lim/cpufreq_min_limit", "-1")
+        node("$lim/limit_stat", "user max 2035200")
         node("sys/kernel/gpu/gpu_max_clock", "500")
         node("sys/kernel/gpu/gpu_freq_table", "1000 950 903 500 231 80")
         node("sys/class/kgsl/kgsl-3d0/max_gpuclk", "500000000")
@@ -972,20 +977,26 @@ class OneiosScriptTest {
         assertEquals(save.text, 0, save.exit)
         assertEquals(
             listOf(
+                "/$lim/cpufreq_max_limit 2035200 -1", "/$lim/cpufreq_min_limit -1 -1",
                 "/$cpu/policy0/scaling_min_freq 2265600 556800", "/$cpu/policy0/scaling_max_freq 1689600 2265600",
                 "/$cpu/policy7/scaling_min_freq 672000 672000", "/$cpu/policy7/scaling_max_freq 2035200 3398400",
                 "/sys/kernel/gpu/gpu_max_clock 500 1000", "/sys/class/kgsl/kgsl-3d0/max_gpuclk 500000000 1000000000",
             ),
             File(f.control, "base/clocks").readLines(),
         )
-        assertTrue(save.text, save.text.contains("Clocks of One UI: /$cpu/policy0/scaling_min_freq 2265600, ") && save.text.contains("KGSL thermal_pwrlevel 9"))
+        assertTrue(save.text, save.text.contains("Clocks of One UI: /$lim/cpufreq_max_limit 2035200, ") && save.text.contains("/$cpu/policy0/scaling_min_freq 2265600, ") && save.text.contains("KGSL thermal_pwrlevel 9"))
         val tops = f.run("oneios_switch.sh", "--clocks-tops")
         assertEquals(tops.text, 0, tops.exit)
         assertEquals("556800", value("$cpu/policy0/scaling_min_freq"))
         assertEquals("3398400", value("$cpu/policy7/scaling_max_freq"))
         assertEquals("1000", value("sys/kernel/gpu/gpu_max_clock"))
         assertEquals("1000000000", value("sys/class/kgsl/kgsl-3d0/max_gpuclk"))
+        assertEquals("-1", value("$lim/cpufreq_max_limit"))
         assertTrue(tops.text, tops.text.contains("clocks: /sys/kernel/gpu/gpu_max_clock 500 -> 1000 (reads 1000)"))
+        assertTrue(tops.text, tops.text.contains("clocks: /$lim/cpufreq_max_limit 2035200 -> -1 (reads -1)"))
+        assertTrue(tops.text, tops.text.contains("clocks: cpufreq_limit limit_stat: user max 2035200"))
+        // The release comes before the policies' own writes.
+        assertTrue(tops.text, tops.text.indexOf("cpufreq_max_limit") in 0 until tops.text.indexOf("scaling_min_freq"))
         assertTrue(File(f.control, "clocks.set").isFile)
 
         // In the session a vendor HAL writes the GPU cap again; then xnuhost ignores SIGTERM and is killed.
@@ -1002,6 +1013,10 @@ class OneiosScriptTest {
         assertEquals("2035200", value("$cpu/policy7/scaling_max_freq"))
         assertEquals("500", value("sys/kernel/gpu/gpu_max_clock"))
         assertEquals("500000000", value("sys/class/kgsl/kgsl-3d0/max_gpuclk"))
+        assertEquals("2035200", value("$lim/cpufreq_max_limit"))
+        assertEquals("-1", value("$lim/cpufreq_min_limit"))
+        // SSRM's cap goes back last, after the policies.
+        assertTrue(r.text, r.text.indexOf("clocks: /$lim/cpufreq_max_limit -1 -> 2035200 (One UI's)") > r.text.indexOf("policy0/scaling_min_freq"))
         assertEquals("95000", trip.readText().trim())
         assertTrue(r.text, r.text.contains("clocks: /sys/kernel/gpu/gpu_max_clock 422 -> 500 (One UI's)"))
         assertTrue(r.text, r.text.contains("clocks: /$cpu/policy7/scaling_max_freq 3398400 -> 2035200 (One UI's)"))
