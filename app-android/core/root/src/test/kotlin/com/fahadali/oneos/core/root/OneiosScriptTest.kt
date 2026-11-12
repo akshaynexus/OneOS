@@ -225,6 +225,8 @@ class OneiosScriptTest {
                 guest(XNUHOST, "xnuhost")
             }
             if (stopped) File(control, "stopped").writeText("1\n")
+            // A switch that never stopped One UI: its framework still runs.
+            if (!stopped) file("props").appendText("init.svc.zygote=running\n")
             val base = File(control, "base")
             File(base, "boot_id").writeText("boot-1\n")
             File(base, "selinux").writeText("Enforcing\n")
@@ -685,14 +687,13 @@ class OneiosScriptTest {
      */
     @Test
     fun aChatteringHoldOfTheRockerStillReturns() = each { f ->
-        // A second of the scripts' clock is 200 ms here: a lift of 0.1 s of it about once a second, on one key or the other,
-        // through a 4 s hold, then both released. No 3 s without a release: the rule before 2026-11-12 never returned here.
+        // A second of the scripts' clock is 200 ms here: a lift of 0.1 s of it at least every 2 s, on one key or the other,
+        // through an 8 s hold, then both released. No 3 s without a release: the rule before 2026-11-12 never returned here.
+        // (8 s, not 4: twelve samples of the stand-ins' clock take longer than 3 s of it.)
         f.phone(scale = 5, state = "returning")
         File(f.control, "keys/session").writeText("$TOKEN\n")
-        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.1", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN",
-            "@ 0.38", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEUP UP")
-        keyEvents(f, "event4", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.3", "EV_KEY KEY_VOLUMEDOWN UP", "@ 0.02", "EV_KEY KEY_VOLUMEDOWN DOWN",
-            "@ 0.58", "EV_KEY KEY_VOLUMEDOWN UP")
+        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.1", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEUP UP")
+        keyEvents(f, "event4", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.3", "EV_KEY KEY_VOLUMEDOWN UP", "@ 0.02", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEDOWN UP", "@ 0.02", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEDOWN UP", "@ 0.02", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEDOWN UP")
         reader(f, "event0")
         reader(f, "event4")
         await("the request despite the chatter") { File(f.session, "return.request").let { it.isFile && it.length() > 0 } }
@@ -883,6 +884,72 @@ class OneiosScriptTest {
         assertTrue(f.returnLog, f.returnLog.contains("The switch ended before One UI's framework was stopped: nothing to restore."))
         assertEquals("returned", f.state)
         assertEquals(emptyList<String>(), f.setprops)
+    }
+
+    // --- A return asked while the switch runs (2026-11-12 11:04: a return in step 3 found no "stopped" mark yet and
+    // tidied up; the switch then stopped the framework, xnuhost did not start, and nothing returned) ---------------
+
+    /** A return before the stop: nothing to restore, and the stop lock stays the return's, so the switch stops nothing. */
+    @Test
+    fun aReturnBeforeTheStopKeepsTheStopLock() = each { f ->
+        f.phone(stopped = false, state = "starting")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(r.text, r.text.contains("The switch ended before One UI's framework was stopped: nothing to restore."))
+        assertTrue(File(f.control, "stop.lock/return").isFile)
+        assertEquals(emptyList<String>(), f.setprops)
+    }
+
+    /** A return during the stop waits for the switch to finish it (the lock), then restores One UI in place. */
+    @Test
+    fun aReturnDuringTheStopWaitsForItThenRestoresOneUi() = each { f ->
+        // A second of the scripts' clock is 100 ms here: the return waits for the lock 15 s = 1.5 s at most.
+        f.phone(scale = 10, stopped = false, state = "starting")
+        assertTrue(File(f.control, "stop.lock").mkdir())      // the switch, in the middle of its stop
+        val r = f.start("oneios_return.sh", "manual", log = "log/return")
+        Thread.sleep(400)
+        assertTrue(r.isAlive)
+        // The switch finishes: the mark, the framework down, the lock given back.
+        File(f.control, "stopped").writeText("1\n")
+        f.file("props").appendText("init.svc.zygote=stopped\n")
+        assertTrue(File(f.control, "stop.lock").delete())
+        assertTrue(r.waitFor(120, TimeUnit.SECONDS))
+        assertFalse(f.returnLog, f.returnLog.contains("nothing to restore"))
+        f.assertInPlace()
+    }
+
+    /** A session left "returned" with One UI's framework down (what the switch before the lock could do) is returned again. */
+    @Test
+    fun aReturnedStateWithTheFrameworkDownIsReturnedAgain() = each { f ->
+        f.phone(state = "returned")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        assertTrue(f.returnLog, f.returnLog.contains("state 'returned', but One UI's framework is down since the switch's stop: returning again"))
+        f.assertInPlace()
+    }
+
+    /** The switch's side, in its text: each step looks for a return, the stop is inside the lock, a failed start returns. */
+    @Test
+    fun theSwitchLetsAReturnWinAtEachStep() {
+        val sw = code(switchScript).joinToString("\n")
+        val arm = sw.indexOf("=== [2/5]")
+        val before = sw.indexOf("return_asked && end_for_return \"One UI's framework was stopped\"", arm)
+        val lock = sw.indexOf("until mkdir \"\$CTL/stop.lock\"", before)
+        val inside = sw.indexOf("return_asked && end_for_return \"One UI's framework was stopped\"", lock)
+        val mark = sw.indexOf("echo \"\$(date +%s)\" > \"\$CTL/stopped\"", inside)
+        val stop = sw.indexOf("setprop ctl.stop zygote", mark)
+        val unlock = sw.indexOf("rmdir \"\$CTL/stop.lock\"", stop)
+        val step4 = sw.indexOf("return_asked && end_for_return \"xnuhost was started\"", unlock)
+        val start = sw.indexOf("=== [4/5]", step4)
+        val failed = sw.indexOf("xnuhost did not start after", start)
+        val back = sw.indexOf("\$SH \"\$STAGE/oneios_return.sh\" switch-failed", failed)
+        val order = listOf(arm, before, lock, inside, mark, stop, unlock, step4, start, failed, back)
+        assertTrue(order.toString(), order.all { it >= 0 } && order == order.sorted())
+        // The return keeps the lock and decides only after it has it.
+        val rt = code(returnScript).joinToString("\n")
+        val taken = rt.indexOf("until mkdir \"\$CTL/stop.lock\"")
+        assertTrue(taken in 0 until rt.indexOf("if [ ! -e \"\$CTL/stopped\" ] && ! framework_down; then"))
+        assertFalse(rt.contains("rmdir \"\$CTL/stop.lock\"") || rt.contains("rm -rf \"\$CTL/stop.lock\""))
     }
 
     /** A return script that cannot run must still end in One UI: the watcher reboots. */

@@ -1026,6 +1026,25 @@ fi
 echo "Return to One UI: hold Volume Up + Volume Down for 3 s (key devices: $(echo $KDEVS)); watcher $(cat "$CTL/watcher.pid"), key readers $(tr '\n' ' ' < "$CTL/keys/pids")"
 echo "If that does nothing: hold Power + Volume Down until the phone restarts (about 7 s). It restarts into One UI."
 
+# A return asked while the switch runs (the watcher, the key readers, the app,
+# adb) wins. The switch and the return meet at one lock, $CTL/stop.lock: the
+# switch holds it from its last look at the state to the end of the stop, the
+# return takes it and never gives it back. So a return either sees the stop
+# done (the "stopped" mark) and restores One UI in place, or the switch never
+# stops anything (2026-11-12 11:04: a return during step 3 found no mark yet,
+# tidied up and ended; the switch then stopped the framework, xnuhost did not
+# start, and nothing returned).
+return_asked() { # true when a return was asked or has begun
+    [ -e "$SESSION/return.request" ] && return 0
+    [ "$(cat "$CTL/state" 2>/dev/null)" = starting ] || return 0
+    return 1
+}
+end_for_return() { # <step>: the switch ends; the return (already under way, or the watcher's) restores
+    echo "A return to One UI was asked before $1 ($(head -c 200 "$SESSION/return.request" 2>/dev/null)): the switch ends here; the return restores One UI"
+    exit 4
+}
+return_asked && end_for_return "One UI's framework was stopped"
+
 echo "=== [3/5] $(date +%T) Stopping the One UI framework ==="
 # The boot screen first, so that it is up when One UI's windows go.
 bootui_begin
@@ -1037,6 +1056,13 @@ for p in $(pidof system_server); do
         case "$t" in /dev/watchdog*|/dev/softdog*) echo "$t" ;; esac
     done
 done 2>/dev/null | sort -u > "$CTL/softdog_nodes"
+# The stop lock (above): 15 s at most; a return holds it for good.
+n=0
+until mkdir "$CTL/stop.lock" 2>/dev/null; do
+    [ $n -lt 75 ] || end_for_return "One UI's framework was stopped (a return holds the stop lock)"
+    sleep 0.2; n=$((n + 1))
+done
+return_asked && end_for_return "One UI's framework was stopped"
 # From here One UI's framework is down: the return starts it again. Without
 # this mark the return only tidies up (a switch that ended before the stop).
 echo "$(date +%s)" > "$CTL/stopped"
@@ -1046,6 +1072,7 @@ n=0
 while [ $n -lt 50 ] && pidof system_server >/dev/null 2>&1; do sleep 0.2; n=$((n + 1)); done
 kill -9 $(pidof system_server) 2>/dev/null
 kill -9 $(pidof zygote64) $(pidof zygote) 2>/dev/null
+rmdir "$CTL/stop.lock" 2>/dev/null
 # system_server is gone, so nothing of One UI writes the clock caps any more.
 clocks_tops
 "$BB" setsid /system/bin/sh "$SELF" --stop-loop </dev/null >/dev/null 2>&1 &
@@ -1058,6 +1085,9 @@ done
 "$BB" setsid /system/bin/sh "$SELF" --feed </dev/null >/dev/null 2>&1 &
 echo $! > "$CTL/feeder.pid"
 echo "One UI's zygote: $(getprop init.svc.zygote); system_server: $(pidof system_server 2>/dev/null || echo gone); surfaceflinger $(pidof surfaceflinger) kept"
+
+# From here a return finds the mark and restores One UI in place.
+return_asked && end_for_return "xnuhost was started"
 
 echo "=== [4/5] $(date +%T) Starting xnuhost ==="
 screen status "Starting xnuhost"
@@ -1081,7 +1111,10 @@ if [ -z "$XP" ] || [ -z "$XNS" ] || [ "$XNS" = "$INIT_NS" ]; then
     echo "!!! xnuhost did not start after $((n / 5)) s (pid '${XP}', namespace '${XNS}'); the last lines of $SESSION/xnuhost.log: $(tail -n 6 "$SESSION/xnuhost.log" | tr '\n' '|')"
     screen status "xnuhost did not start: $(grep . "$SESSION/xnuhost.log" 2>/dev/null | tail -n 1)"
     echo failed > "$CTL/state"
-    # The watcher sees the state and returns; nothing else to undo here.
+    # One UI's framework is down: never left so. The return, from here (the
+    # watcher returns too on this state, or may have ended already; the return
+    # takes one caller at a time).
+    $SH "$STAGE/oneios_return.sh" switch-failed
     exit 4
 fi
 # The switch's own record of the two, where the guest cannot write: what the

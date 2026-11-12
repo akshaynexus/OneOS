@@ -376,6 +376,17 @@ busybox into an Android guest's `/data`). `oneios_return.sh reboot` goes straigh
 nothing, and a switch that ended before it stopped One UI's zygote (the stop is marked in `control/stopped`)
 only has its helpers ended: neither restarts anything.
 
+**A return asked while the switch runs wins** (since 2026-11-12; before, a return during step 3 found no mark yet,
+tidied up and ended, and the switch then stopped the framework anyway: xnuhost did not start and nothing returned).
+The switch and the return meet at `control/stop.lock` (`mkdir`, atomic). The switch takes it for its stop: it looks
+at the state and `session/return.request` once more inside it, writes `control/stopped`, stops zygote and
+system_server, and gives it back; it also ends without stopping anything when a return was asked before step 3, or
+when the lock does not come within 15 s, and it starts no xnuhost when a return was asked after the stop. The return
+takes the lock right after it writes `returning` (waiting up to 15 s for a stop under way) and keeps it, so its look at
+`control/stopped` is final and no switch stops One UI after it. "Nothing to restore" also needs One UI's zygote
+running; a state `returned` with the mark and the framework down is returned again. A switch whose xnuhost does not
+start runs `oneios_return.sh switch-failed` itself, and no longer only counts on a watcher that may have ended.
+
 ## Boot screen
 
 From the stop of One UI's framework until iOS draws, the screen shows **OneOS's own boot screen**, the one a
@@ -574,7 +585,7 @@ the two meet at the return's lock.
 - The same class runs **the way back** against a fake phone: the key readers, the poll, the watcher and
   `oneios_return.sh` themselves, with stand-ins for Android's tools
   (`core/root/src/test/resources/oneios/phone-tools.sh`), processes as folders, and a clock that runs faster.
-  No real process is signalled. Covered: the chord on two devices, a chattering hold (a short lift about once a second
+  No real process is signalled. Covered: a return before, during and after the switch's stop (the stop lock), the chord on two devices, a chattering hold (a short lift about once a second
   through the hold: the rule before 2026-11-12, no release at all for 3 s, never returned there), a long release, a short hold, one key, auto-repeat, an old
   session's reader, the poll with no event at all, the keys starting the return without a watcher; the watcher
   on xnuhost's end, on a request, on a missing `ready`, with a wiped `session/` folder, and with a return

@@ -272,8 +272,16 @@ fi
 # One exception. The watcher and the key readers exist only in a session, so
 # a state they cannot read is a session whose control folder is gone; if One
 # UI's framework is down as well, nothing here can be checked: the reboot.
+framework_down() { [ "$(getprop init.svc.zygote)" != running ] && ! pidof system_server >/dev/null 2>&1; }
 case "$(cat "$CTL/state" 2>/dev/null)" in
-    returned) say "no open session (state 'returned'): nothing to return from"; exit 0 ;;
+    returned)
+        # Returned, but the switch stopped One UI's framework after that return
+        # (a switch from before the stop lock, oneios_switch.sh): an open session.
+        if [ -e "$CTL/stopped" ] && framework_down; then
+            say "state 'returned', but One UI's framework is down since the switch's stop: returning again"
+        else
+            say "no open session (state 'returned'): nothing to return from"; exit 0
+        fi ;;
     '')
         case "$WHO" in
             watcher|keys-direct)
@@ -303,6 +311,17 @@ if ! mkdir "$CTL/returning.lock" 2>/dev/null; then
 fi
 echo $$ > "$CTL/returning.lock/pid"
 echo returning > "$CTL/state"
+# The switch's stop lock (oneios_switch.sh, step 3): taken and kept. A switch in
+# the middle of its stop finishes it first (15 s at most, then the lock counts as
+# that switch's leftover), so the "stopped" mark below is final, and a switch
+# that has not stopped anything yet never will.
+n=0
+until mkdir "$CTL/stop.lock" 2>/dev/null; do
+    [ -e "$CTL/stop.lock/return" ] && break           # an earlier return's: the switch can stop nothing any more
+    [ $n -lt 75 ] || { say "the switch's stop lock is still held after 15 s: taken over"; break; }
+    sleep 0.2; n=$((n + 1))
+done
+echo $$ > "$CTL/stop.lock/return"
 echo oneios_return 2>/dev/null > "$T/sys/power/wake_lock"
 GTOK="$$.$(date +%s)"
 echo "$GTOK" > "$CTL/return.guard"
@@ -437,7 +456,7 @@ fi
 # The switch ended before it stopped One UI's zygote (it marks the stop):
 # One UI never went away, so there is nothing to check or start. Its helpers
 # end, and that is the whole return.
-if [ ! -e "$CTL/stopped" ]; then
+if [ ! -e "$CTL/stopped" ] && ! framework_down; then
     true > "$CTL/stop-loop.off"
     true > "$CTL/feeder.off"
     end_helper "$CTL/stop-loop.pid" --stop-loop
