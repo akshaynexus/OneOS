@@ -676,6 +676,41 @@ class OneiosScriptTest {
         assertFalse(File(f.session, "return.request").exists())
     }
 
+    /**
+     * The S24 Ultra's volume keys are one rocker: pressing both ends chatters (session of 2026-11-12: 6 key events in 3 s,
+     * no return). Releases under 0.5 s do not end the hold; the two keys go down at the same moment on two devices.
+     */
+    @Test
+    fun aChatteringHoldOfTheRockerStillReturns() = each { f ->
+        // A second of the scripts' clock is 200 ms here: a lift of 0.1 s of it about once a second, on one key or the other,
+        // through a 4 s hold, then both released. No 3 s without a release: the rule before 2026-11-12 never returned here.
+        f.phone(scale = 5, state = "returning")
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.1", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN",
+            "@ 0.38", "EV_KEY KEY_VOLUMEUP UP", "@ 0.02", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.38", "EV_KEY KEY_VOLUMEUP UP")
+        keyEvents(f, "event4", "EV_KEY KEY_VOLUMEDOWN DOWN", "@ 0.3", "EV_KEY KEY_VOLUMEDOWN UP", "@ 0.02", "EV_KEY KEY_VOLUMEDOWN DOWN",
+            "@ 0.58", "EV_KEY KEY_VOLUMEDOWN UP")
+        reader(f, "event0")
+        reader(f, "event4")
+        await("the request despite the chatter") { File(f.session, "return.request").let { it.isFile && it.length() > 0 } }
+        assertTrue(File(f.session, "return.request").readText().startsWith("keys: Volume Up + Volume Down held 3 s at "))
+    }
+
+    /** A release of a second ends the hold, and the 2 s after it are not 3 s. */
+    @Test
+    fun aLongReleaseEndsTheHold() = each { f ->
+        f.phone(scale = 5, state = "returning")
+        File(f.control, "keys/session").writeText("$TOKEN\n")
+        keyEvents(f, "event0", "EV_KEY KEY_VOLUMEUP DOWN", "@ 0.2", "EV_KEY KEY_VOLUMEUP UP", "@ 0.2", "EV_KEY KEY_VOLUMEUP DOWN",
+            "@ 0.4", "EV_KEY KEY_VOLUMEUP UP")
+        keyEvents(f, "event4", "EV_KEY KEY_VOLUMEDOWN DOWN")
+        reader(f, "event0")
+        reader(f, "event4")
+        await("the last release") { File(f.control, "keys/up").takeIf { it.isFile }?.readText()?.trim() == "UP" && File(f.control, "keys/down").isFile }
+        Thread.sleep(1500)
+        assertFalse(File(f.session, "return.request").exists())
+    }
+
     /** A key device with auto-repeat reports a held key again and again: that is not a release. Bare values count too. */
     @Test
     fun aHeldKeysAutoRepeatDoesNotBreakTheHold() = each { f ->
@@ -722,7 +757,12 @@ class OneiosScriptTest {
         f.start("oneios_switch.sh", "--keys-poll", TOKEN, "/dev/input/event0", "/dev/input/event4")
         Thread.sleep(1500)
         assertFalse(File(f.session, "return.request").exists())
-        // Both down (each on its own device): seven samples, half a second apart, later.
+        // Both down (each on its own device): seven samples, half a second apart, later; one sample without Volume
+        // Down in between (the rocker's chatter) does not start the count again.
+        keys("event4", "KEY_VOLUMEDOWN")
+        Thread.sleep(150)
+        keys("event4")
+        Thread.sleep(30)
         keys("event4", "KEY_VOLUMEDOWN")
         await("the request of the poll") { File(f.session, "return.request").let { it.isFile && it.length() > 0 } }
         assertTrue(File(f.session, "return.request").readText().startsWith("keys: Volume Up + Volume Down down for 3 s (polled) at "))

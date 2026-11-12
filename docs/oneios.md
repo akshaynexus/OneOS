@@ -478,8 +478,8 @@ have started at all. From the fastest to the one that cannot fail:
 
 | # | What | Works when |
 |---|---|---|
-| 1 | **Volume Up + Volume Down, 3 s.** One `getevent -lq` reader per key device (on this phone Volume Up is on `gpio-keys`, Volume Down on the PMIC's `pmic_resin`) | always, unless a program grabs the key device |
-| 2 | The same chord from the keys' **state**: `getevent -pl` asks each device twice a second (EVIOCGKEY; a key that is down is marked `*`) | also when a program has grabbed the keys: a grab takes the events from other readers, not the state |
+| 1 | **Volume Up + Volume Down, 3 s.** One `getevent -lq` reader per key device (on this phone Volume Up is on `gpio-keys`, Volume Down on the PMIC's `pmic_resin`). When both are down, a timer looks at the two keys every 0.25 s for 3 s; a release of 0.5 s or more ends the hold, a shorter one does not (the S24 Ultra's two keys are one rocker, and pressing both ends chatters) | always, unless a program grabs the key device |
+| 2 | The same chord from the keys' **state**: `getevent -pl` asks each device twice a second (EVIOCGKEY; a key that is down is marked `*`); seven samples with both down, one sample without them in between allowed | also when a program has grabbed the keys: a grab takes the events from other readers, not the state |
 | 3 | **The watcher**: returns on `session/return.request`, when xnuhost ends, when the switch never started it (60 s), when the guest never reported `ready` (600 s) | iOS crashed, never started, or asked to leave |
 | 4 | The key readers start the return themselves if the session is still not returning 5 s after their request | the watcher is gone or stuck |
 | 5 | **The return's guard**: a process of its own that reboots the phone if a step of the return has not finished within its own limit (75 s for Gate B; above), or the whole return after 600 s; the watcher reboots at once if the return script cannot run or ends with an error | a step of the return hangs or the script is damaged |
@@ -555,7 +555,8 @@ the two meet at the return's lock.
 - The same class runs **the way back** against a fake phone: the key readers, the poll, the watcher and
   `oneios_return.sh` themselves, with stand-ins for Android's tools
   (`core/root/src/test/resources/oneios/phone-tools.sh`), processes as folders, and a clock that runs faster.
-  No real process is signalled. Covered: the chord on two devices, a short hold, one key, auto-repeat, an old
+  No real process is signalled. Covered: the chord on two devices, a chattering hold (a short lift about once a second
+  through the hold: the rule before 2026-11-12, no release at all for 3 s, never returned there), a long release, a short hold, one key, auto-repeat, an old
   session's reader, the poll with no event at all, the keys starting the return without a watcher; the watcher
   on xnuhost's end, on a request, on a missing `ready`, with a wiped `session/` folder, and with a return
   script that cannot run; the return in place after SIGTERM and after SIGKILL of tasks in other namespaces,

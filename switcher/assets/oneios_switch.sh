@@ -640,14 +640,22 @@ case "$MODE" in
             # not a release: taken as one, a hold would never reach 3 s.
             case "$val" in DOWN|00000001) v=DOWN ;; UP|00000000) v=UP ;; *) continue ;; esac
             echo "$v" > "$KS/$k"
-            if [ "$(cat "$KS/up" 2>/dev/null)" = DOWN ] && [ "$(cat "$KS/down" 2>/dev/null)" = DOWN ]; then
-                both="$(date +%s).$$.$kd.$RANDOM"; echo "$both" > "$KS/both"
-                ( sleep 3
-                  [ "$(cat "$KS/session" 2>/dev/null)" = "$tok" ] && [ "$(cat "$KS/both" 2>/dev/null)" = "$both" ] &&
-                      [ "$(cat "$KS/up" 2>/dev/null)" = DOWN ] && [ "$(cat "$KS/down" 2>/dev/null)" = DOWN ] &&
+            # Both down: a timer looks at the two keys every 0.25 s for 3 s.
+            # The S24 Ultra's volume keys are one rocker, and pressing both of
+            # its ends chatters: one end lifts for a moment and comes back
+            # (session of 2026-11-12: 6 key events in 3 s, no 3 s without a
+            # release). A release of 0.5 s or more ends the hold; a shorter one
+            # does not. The timer reads only the two keys' files: there is no
+            # shared token for the other reader to clear (two readers that both
+            # see the chord start a timer each, and ask_return asks once).
+            if [ "$v" = DOWN ] && [ "$(cat "$KS/up" 2>/dev/null)" = DOWN ] && [ "$(cat "$KS/down" 2>/dev/null)" = DOWN ]; then
+                ( n=0 miss=0
+                  while [ $n -lt 12 ] && [ $miss -lt 2 ]; do
+                      sleep 0.25; n=$((n + 1))
+                      if [ "$(cat "$KS/up" 2>/dev/null)" = DOWN ] && [ "$(cat "$KS/down" 2>/dev/null)" = DOWN ]; then miss=0; else miss=$((miss + 1)); fi
+                  done
+                  [ $miss -lt 2 ] && [ "$(cat "$KS/session" 2>/dev/null)" = "$tok" ] &&
                       ask_return "keys: Volume Up + Volume Down held 3 s" ) &
-            else
-                true > "$KS/both"
             fi
         done
         exit 0
@@ -659,7 +667,9 @@ case "$MODE" in
         # events from every other reader, the one above included, but not this
         # state: so the chord works even if xnuhost grabs the keys, which its
         # contract forbids (OneiOS docs/agents.md). Twice a second; seven
-        # samples in a row with both keys down are 3 s.
+        # samples with both keys down are 3 s. One sample without them in
+        # between does not end the hold (the rocker's chatter, see --keys); two
+        # in a row do.
         [ -n "$2" ] && [ -n "$3" ] || exit 3
         tok=$2
         shift 2
@@ -667,14 +677,16 @@ case "$MODE" in
         reader_start
         TMO=""
         command -v timeout >/dev/null 2>&1 && TMO="timeout 2"
-        n=0
+        n=0 miss=0
         while [ "$(cat "$KS/session" 2>/dev/null)" = "$tok" ]; do
             st=$(for kd in "$@"; do $TMO getevent -pl "$kd" 2>/dev/null; done)
             held=0
             case "$st" in *"KEY_VOLUMEUP*"*) case "$st" in *"KEY_VOLUMEDOWN*"*) held=1 ;; esac ;; esac
-            if [ $held = 1 ]; then n=$((n + 1)); else n=0; fi
+            if [ $held = 1 ]; then n=$((n + 1)); miss=0
+            elif [ $n -gt 0 ]; then miss=$((miss + 1)); [ $miss -lt 2 ] || { n=0; miss=0; }
+            fi
             if [ $n -ge 7 ]; then
-                n=0
+                n=0 miss=0
                 ask_return "keys: Volume Up + Volume Down down for 3 s (polled)"
             fi
             sleep 0.5
