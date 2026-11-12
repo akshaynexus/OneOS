@@ -1540,7 +1540,11 @@ class OneiosScriptTest {
         for ((say, cmd) in steps) assertTrue("$say before $cmd", inner.indexOf(say) in 0 until inner.indexOf(cmd))
         // Nothing starts under a switch that gave up meanwhile; the trap stays for an exec that fails.
         val exec = inner.indexOf("exec \"/data/runtime/\$R_XNUHOST\"")
-        assertTrue(inner.indexOf("[ \"\$(cat /data/control/state 2>/dev/null)\" = starting ] ||") in 0 until exec)
+        // "running" is no reason to give up: the outer switch writes it as soon as it reads the pid (7129c37).
+        val state = inner.indexOf("ST=\$(cat /data/control/state 2>/dev/null)")
+        assertTrue(state in 0 until exec)
+        assertTrue(inner.indexOf("starting|running) ;;", state) in state until exec)
+        assertTrue(inner.indexOf("die_inner \"the switch is no longer starting", state) in state until exec)
         assertFalse(inner.contains("trap - EXIT"))
         // The switch: until the pid is written, for as long as the inner shell runs, 30 s at most.
         val session = sw.substring(sw.indexOf("echo \"=== [4/5]"))
