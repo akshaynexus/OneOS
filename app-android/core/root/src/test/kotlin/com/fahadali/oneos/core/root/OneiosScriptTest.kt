@@ -589,6 +589,9 @@ class OneiosScriptTest {
                 assertFalse("${f.name} has '$never'", text.contains(never))
             }
         }
+        // The clock caps are One UI's to set and the session's to lift; the kernel's thermal zones, trips and cooling
+        // devices are never written (OneiOS docs/hardware.md 7d).
+        for (f in listOf(switchScript, returnScript)) assertFalse(f.name, code(f).joinToString("\n").let { it.contains("/sys/class/thermal") || it.contains("cooling_device") })
         val sw = code(switchScript).joinToString("\n")
         // xnuhost's namespace has the stage over /data, and the session refuses to go on if One UI's data shows.
         assertTrue(sw.contains("mount --bind \"\$STAGE\" /data"))
@@ -940,6 +943,84 @@ class OneiosScriptTest {
         assertEquals(listOf("-TERM 5000", "-9 5000", "-9 5001", "-9 5002", "-9 5003"), f.kills)
         assertEquals("1", f.lines("sys/fs/cgroup/oneios_session/cgroup.kill").firstOrNull())
         f.assertInPlace(r.text)
+    }
+
+    /**
+     * One UI's clock caps (SSRM's, left by system_server): saved while One UI is whole, the hardware's range for the
+     * session once system_server is gone, One UI's values back at the return before its zygote, a killed xnuhost's too.
+     */
+    @Test
+    fun oneUisClockCapsAreLiftedForTheSessionAndPutBackAtTheReturn() = each { f ->
+        f.phone()
+        fun node(path: String, value: String) = f.file(path).also { it.parentFile.mkdirs(); it.writeText("$value\n") }
+        fun value(path: String) = f.file(path).readText().trim()
+        val cpu = "sys/devices/system/cpu/cpufreq"
+        // policy, cpuinfo min, cpuinfo max, One UI's floor (a boost), One UI's cap
+        for (p in listOf(listOf("0", "556800", "2265600", "2265600", "1689600"), listOf("7", "672000", "3398400", "672000", "2035200"))) {
+            node("$cpu/policy${p[0]}/cpuinfo_min_freq", p[1]); node("$cpu/policy${p[0]}/cpuinfo_max_freq", p[2])
+            node("$cpu/policy${p[0]}/scaling_min_freq", p[3]); node("$cpu/policy${p[0]}/scaling_max_freq", p[4])
+        }
+        node("sys/kernel/gpu/gpu_max_clock", "500")
+        node("sys/kernel/gpu/gpu_freq_table", "1000 950 903 500 231 80")
+        node("sys/class/kgsl/kgsl-3d0/max_gpuclk", "500000000")
+        node("sys/class/kgsl/kgsl-3d0/gpu_available_frequencies", "1000000000 500000000 231000000")
+        node("sys/class/kgsl/kgsl-3d0/thermal_pwrlevel", "9")
+        // a thermal zone and its trip: never the scripts' to write
+        val trip = node("sys/class/thermal/thermal_zone0/trip_point_0_temp", "95000")
+
+        val save = f.run("oneios_switch.sh", "--clocks-save")
+        assertEquals(save.text, 0, save.exit)
+        assertEquals(
+            listOf(
+                "/$cpu/policy0/scaling_min_freq 2265600 556800", "/$cpu/policy0/scaling_max_freq 1689600 2265600",
+                "/$cpu/policy7/scaling_min_freq 672000 672000", "/$cpu/policy7/scaling_max_freq 2035200 3398400",
+                "/sys/kernel/gpu/gpu_max_clock 500 1000", "/sys/class/kgsl/kgsl-3d0/max_gpuclk 500000000 1000000000",
+            ),
+            File(f.control, "base/clocks").readLines(),
+        )
+        assertTrue(save.text, save.text.contains("Clocks of One UI: /$cpu/policy0/scaling_min_freq 2265600, ") && save.text.contains("KGSL thermal_pwrlevel 9"))
+        val tops = f.run("oneios_switch.sh", "--clocks-tops")
+        assertEquals(tops.text, 0, tops.exit)
+        assertEquals("556800", value("$cpu/policy0/scaling_min_freq"))
+        assertEquals("3398400", value("$cpu/policy7/scaling_max_freq"))
+        assertEquals("1000", value("sys/kernel/gpu/gpu_max_clock"))
+        assertEquals("1000000000", value("sys/class/kgsl/kgsl-3d0/max_gpuclk"))
+        assertTrue(tops.text, tops.text.contains("clocks: /sys/kernel/gpu/gpu_max_clock 500 -> 1000 (reads 1000)"))
+        assertTrue(File(f.control, "clocks.set").isFile)
+
+        // In the session a vendor HAL writes the GPU cap again; then xnuhost ignores SIGTERM and is killed.
+        node("sys/kernel/gpu/gpu_max_clock", "422")
+        File(f.file("proc/$XNUHOST"), "ignore_term").createNewFile()
+        // A line that is not one of the nodes, or not a number, is never written.
+        File(f.control, "base/clocks").appendText("/sys/class/thermal/thermal_zone0/trip_point_0_temp 1 2\n/$cpu/policy0/../policy7/scaling_max_freq 5 6\n/sys/kernel/gpu/gpu_max_clock x 1\n")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        assertEquals("2265600", value("$cpu/policy0/scaling_min_freq"))
+        assertEquals("1689600", value("$cpu/policy0/scaling_max_freq"))
+        assertEquals("672000", value("$cpu/policy7/scaling_min_freq"))
+        assertEquals("2035200", value("$cpu/policy7/scaling_max_freq"))
+        assertEquals("500", value("sys/kernel/gpu/gpu_max_clock"))
+        assertEquals("500000000", value("sys/class/kgsl/kgsl-3d0/max_gpuclk"))
+        assertEquals("95000", trip.readText().trim())
+        assertTrue(r.text, r.text.contains("clocks: /sys/kernel/gpu/gpu_max_clock 422 -> 500 (One UI's)"))
+        assertTrue(r.text, r.text.contains("clocks: /$cpu/policy7/scaling_max_freq 3398400 -> 2035200 (One UI's)"))
+        // Before One UI's zygote and the first gate.
+        assertTrue(r.text, r.text.indexOf("clocks: ") in 0 until r.text.indexOf("Gate A"))
+        assertFalse(File(f.control, "clocks.set").exists())
+    }
+
+    /** Without the switch's mark (it never wrote the session's clocks) the return writes no clock node. */
+    @Test
+    fun aReturnWithoutTheClockMarkWritesNoClock() = each { f ->
+        f.phone()
+        val cap = f.file("sys/kernel/gpu/gpu_max_clock").also { it.parentFile.mkdirs(); it.writeText("700\n") }
+        File(f.control, "base/clocks").writeText("/sys/kernel/gpu/gpu_max_clock 500 1000\n")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        assertEquals("700", cap.readText().trim())
+        assertFalse(r.text, r.text.contains("clocks: "))
     }
 
     /** Where the composer's restart does not take surfaceflinger with it, surfaceflinger is restarted by name. */

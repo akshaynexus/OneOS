@@ -414,8 +414,67 @@ check_list() {
     [ -z "$extra" ] || refuse "$kind/ holds files its list does not name ($extra): stage the $kind again"
 }
 
+# --- ONE UI'S CLOCK CAPS ----------------------------------------------------
+# One UI (Samsung's SSRM in system_server, and the HALs it drives) caps the CPU and
+# GPU clocks when the phone is warm, and its power HAL raises the CPUs' floors in
+# bursts. The switch stops system_server, so whatever it last wrote stayed for the
+# whole session: 1.7-2.0 GHz CPUs and a 500 MHz GPU after a warm One UI (the S24
+# Ultra, 2026-11-12; OneiOS docs/hardware.md 7d). These nodes are saved while One
+# UI is whole (clocks_save, into control/base/clocks: node, One UI's value, the
+# session's) and the hardware's range is written once system_server is gone
+# (clocks_tops); the return writes One UI's values back before its zygote starts,
+# on every path that stopped One UI, a killed xnuhost's too. The kernel's thermal
+# zones, trips and cooling devices are never written: they, LMh and xnuhost's own
+# thermal step (OneiOS runtime/bridges/thermal) cap the session. Nothing under
+# /sys/power.
+clock_top() { # <list of numbers>: the largest
+    awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/ && $i + 0 > m) m = $i + 0 } END { if (m) print m }'
+}
+clocks_save() {
+    out="$CTL/base/clocks"
+    true > "$out"
+    for pol in "$T"/sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$pol" ] || continue
+        lo=$(cat "$pol/cpuinfo_min_freq" 2>/dev/null); hi=$(cat "$pol/cpuinfo_max_freq" 2>/dev/null)
+        mn=$(cat "$pol/scaling_min_freq" 2>/dev/null); mx=$(cat "$pol/scaling_max_freq" 2>/dev/null)
+        case "$lo$hi$mn$mx" in ''|*[!0-9]*) continue ;; esac
+        echo "${pol#"$T"}/scaling_min_freq $mn $lo" >> "$out"
+        echo "${pol#"$T"}/scaling_max_freq $mx $hi" >> "$out"
+    done
+    g="$T/sys/kernel/gpu"
+    v=$(cat "$g/gpu_max_clock" 2>/dev/null); top=$(clock_top < "$g/gpu_freq_table" 2>/dev/null)
+    case "$v" in ''|*[!0-9]*) ;; *) [ -z "$top" ] || echo "/sys/kernel/gpu/gpu_max_clock $v $top" >> "$out" ;; esac
+    k="$T/sys/class/kgsl/kgsl-3d0"
+    v=$(cat "$k/max_gpuclk" 2>/dev/null); top=$(clock_top < "$k/gpu_available_frequencies" 2>/dev/null)
+    case "$v" in ''|*[!0-9]*) ;; *) [ -z "$top" ] || echo "/sys/class/kgsl/kgsl-3d0/max_gpuclk $v $top" >> "$out" ;; esac
+    pl=""
+    [ ! -e "$k/thermal_pwrlevel" ] || pl="; KGSL thermal_pwrlevel $(cat "$k/thermal_pwrlevel" 2>/dev/null)"
+    echo "Clocks of One UI: $(awk '{ printf "%s %s, ", $1, $2 }' "$out" | sed 's/, $//')$pl"
+}
+clocks_tops() {
+    # The mark first: from here the return writes One UI's values back.
+    echo "$(date +%s)" > "$CTL/clocks.set"
+    while read -r node old new; do
+        case "$node" in /sys/devices/system/cpu/cpufreq/policy*/scaling_m??_freq|/sys/kernel/gpu/gpu_max_clock|/sys/class/kgsl/kgsl-3d0/max_gpuclk) ;; *) continue ;; esac
+        case "$old$new" in ''|*[!0-9]*) continue ;; esac
+        if echo "$new" > "$T$node" 2>/dev/null; then
+            echo "clocks: $node $old -> $new (reads $(cat "$T$node" 2>/dev/null))"
+        else
+            echo "clocks: $node $old -> $new not written (left at $(cat "$T$node" 2>/dev/null))"
+        fi
+    done < "$CTL/base/clocks"
+    k="$T/sys/class/kgsl/kgsl-3d0"
+    [ ! -e "$k/thermal_pwrlevel" ] || echo "clocks: KGSL thermal_pwrlevel $(cat "$k/thermal_pwrlevel" 2>/dev/null), max_gpuclk $(cat "$k/max_gpuclk" 2>/dev/null)"
+}
+
 # --- INTERNAL MODES --------------------------------------------------------
 case "$MODE" in
+    --clocks-save|--clocks-tops)
+        # The tests' way in (OneiosScriptTest, against a fake sysfs): the same two steps the session takes.
+        [ -n "$T" ] || { echo "$MODE: for the tests only"; exit 2; }
+        mkdir -p "$CTL/base"
+        if [ "$MODE" = --clocks-save ]; then clocks_save; else clocks_tops; fi
+        exit 0 ;;
     --inner)
         # Inside the new mount namespace (unshare -m), still root. The stage
         # becomes /data: nothing else of One UI's /data exists in here.
@@ -908,6 +967,7 @@ awk '{ print $5 }' /proc/1/mountinfo | sort > "$B/mounts"
 for bl in "$T"/sys/class/backlight/*/brightness; do
     [ -f "$bl" ] && echo "${bl#"$T"} $(cat "$bl" 2>/dev/null)"
 done > "$B/backlight" 2>/dev/null
+clocks_save
 echo "Baseline: boot $(cat "$B/boot_id"), SELinux $(cat "$B/selinux"), $(tr '\n' ' ' < "$B/pids")wifi $(cat "$B/wifi_on")"
 
 echo "=== [2/5] $(date +%T) Arming the way back ==="
@@ -975,6 +1035,8 @@ n=0
 while [ $n -lt 50 ] && pidof system_server >/dev/null 2>&1; do sleep 0.2; n=$((n + 1)); done
 kill -9 $(pidof system_server) 2>/dev/null
 kill -9 $(pidof zygote64) $(pidof zygote) 2>/dev/null
+# system_server is gone, so nothing of One UI writes the clock caps any more.
+clocks_tops
 "$BB" setsid /system/bin/sh "$SELF" --stop-loop </dev/null >/dev/null 2>&1 &
 echo $! > "$CTL/stop-loop.pid"
 # Samsung's software watchdog: its magic close now, then the feeder.

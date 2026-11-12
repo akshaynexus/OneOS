@@ -298,13 +298,23 @@ runtime with xnuhost is staged, this is where every switch ends.**
 **Then:**
 
 1. Session folder, control folder and baseline: boot id, SELinux mode, properties, the pids of vold, keystore2,
-   surfaceflinger and servicemanager, init's mount points.
+   surfaceflinger and servicemanager, init's mount points, the panel's brightness, and **One UI's clock caps**
+   (`control/base/clocks`: each node, One UI's value, the session's): `scaling_min_freq` and `scaling_max_freq` of
+   every cpufreq policy, `/sys/kernel/gpu/gpu_max_clock` and KGSL's `max_gpuclk`. One UI (Samsung's SSRM in
+   system_server) caps them when the phone is warm and its power HAL raises the floors in bursts; with
+   system_server stopped, its last values stayed for the whole session (1.7-2.0 GHz CPUs and a 500 MHz GPU after a
+   warm One UI, the S24 Ultra, 2026-11-12). `switch.log`: `Clocks of One UI: ...`.
 2. The way back is armed first, each part in a session of its own (`setsid`) in init's mount namespace: the
    watcher, a `getevent` reader per volume-key device, and a poll of the keys' state. A kernel wakelock
    (`oneios_session`) keeps the phone awake without One UI's power manager. **One UI is not stopped unless all
    of them run and the wakelock is held**; if not, the switch ends there.
 3. The boot screen starts (below), then One UI's zygote and zygote_secondary are stopped, so system_server and
    every app end; a loop keeps them stopped. surfaceflinger, the vendor composer, audioserver, netd, vold, keystore2 and the radio keep running.
+   Once system_server is gone the switch marks `control/clocks.set` and writes the hardware's range into those
+   nodes (`cpuinfo_min_freq`, `cpuinfo_max_freq`, the top of `gpu_freq_table` and `gpu_available_frequencies`),
+   one line each in `switch.log`: `clocks: NODE OLD -> NEW (reads N)`. The kernel's thermal zones, trips and
+   cooling devices are never written, nor anything under `/sys/power` but the wakelock: the kernel's junction
+   trips, LMh and xnuhost's own thermal step (OneiOS `runtime/bridges/thermal`) are what cap a session.
    Samsung's software watchdog gets its magic close and a feeder, as in an Android session.
 4. xnuhost starts in a **new mount namespace** in which the stage is bound over `/data`; `runtime`, `image`,
    `control`, `bin` and the two session scripts are read-only there. It gets a cgroup of its own
@@ -327,7 +337,11 @@ runtime with xnuhost is staged, this is where every switch ends.**
 1. **The session ends.** SIGTERM to xnuhost, 20 s; then everything that is left is killed: the cgroup at once
    (`cgroup.kill`), every process in xnuhost's mount namespace, and every process outside init's namespace whose
    mount table still shows the stage. The key readers and the watcher end. The boot screen, where it is still
-   up, says "Returning to One UI" during this step and is ended at its end, before the first gate.
+   up, says "Returning to One UI" during this step and is ended at its end, before the first gate. Then the
+   panel's brightness and, when the switch marked `clocks.set`, **One UI's clock caps** go back from the baseline,
+   in the reverse order of the switch's writes: `clocks: NODE NOW -> OLD (One UI's)` in `return.log`, also after
+   a SIGKILL of xnuhost (the return runs on every way back but the reboot, which resets them anyway). Only those
+   nodes and only numbers; a node that cannot be written is logged and does not stop the return.
 2. **Gate A.** No such process is left; the stage is mounted in no process's mount table (every namespace, not
    only init's: OneOS's run 45); nothing was mounted on One UI's partitions; the same boot; vold, keystore2 and
    servicemanager have their pids of the switch; the daemons One UI cannot restart are running; SELinux is as
@@ -559,7 +573,10 @@ the two meet at the return's lock.
   through the hold: the rule before 2026-11-12, no release at all for 3 s, never returned there), a long release, a short hold, one key, auto-repeat, an old
   session's reader, the poll with no event at all, the keys starting the return without a watcher; the watcher
   on xnuhost's end, on a request, on a missing `ready`, with a wiped `session/` folder, and with a return
-  script that cannot run; the return in place after SIGTERM and after SIGKILL of tasks in other namespaces,
+  script that cannot run; One UI's clock caps against a fake sysfs (`--clocks-save` and `--clocks-tops`, the
+  switch's two steps run alone: the saved lines, the hardware's range written, then the return after a killed
+  xnuhost writes One UI's values back before Gate A, leaves a thermal trip and any line that is not one of the nodes
+  alone, and writes no clock without the switch's mark); the return in place after SIGTERM and after SIGKILL of tasks in other namespaces,
   with a surfaceflinger that died or outlived the composer; and a reboot for each failed check (a process that
   cannot be killed, a stage mount left anywhere, a mount on One UI's partitions, another vold, another SELinux
   mode, another boot, a zygote that started by itself, a composer, surfaceflinger or audioserver that does not
