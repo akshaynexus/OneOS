@@ -520,6 +520,9 @@ usb_save() {
         echo "udc=$(usb_read "$UDC_FILE")"
         echo "adbd=$(getprop init.svc.adbd)"
         echo "configfs=$(getprop sys.usb.configfs)"
+        # The repairs of the USB watcher and the return: only with $STAGE/usb-repair (or ONEIOS_USB_REPAIR=1)
+        _rep=0; { [ -e "$STAGE/usb-repair" ] || [ "${ONEIOS_USB_REPAIR:-0}" = 1 ]; } && _rep=1
+        echo "repair=$_rep"
     } > "$CTL/base/usb"
     echo "USB of One UI: $(usb_now); USB debugging $([ $_adb = 1 ] && echo on || echo off)"
 }
@@ -561,7 +564,13 @@ case "$MODE" in
         BOUND=$(conf "$U" udc)
         [ "$BOUND" != none ] || BOUND=""
         EVERY=3
-        usay "watching every ${EVERY} s: keeps config $CFG, adbd and UDC ${CTRL:-?} (bound '${BOUND}' at the switch)"
+        # Repairs only where the stage asks for them (usb-repair, recorded at the switch as repair=1): not run on the
+        # phone yet, so off by default; off, every repair is logged and nothing is written.
+        REPAIR=$(conf "$U" repair)
+        OFF=""; [ "$REPAIR" = 1 ] || OFF=" (repairs are off: logged only; $STAGE/usb-repair turns them on)"
+        act() { [ "$REPAIR" = 1 ] || return 0; "$@"; }
+        udc_put() { [ "$REPAIR" = 1 ] || return 0; echo "$1" 2>/dev/null > "$UDC_FILE"; }
+        usay "watching every ${EVERY} s: keeps config $CFG, adbd and UDC ${CTRL:-?} (bound '${BOUND}' at the switch), repairs $([ "$REPAIR" = 1 ] && echo on || echo off)"
         last=""; n=0; fix=-100; plug=0; tries=0; cable0=""
         while [ ! -e "$CTL/usb-watch.off" ]; do
             case "$(cat "$CTL/state" 2>/dev/null)" in returning|returned|failed) usay "the session is over: the watcher ends"; exit 0 ;; esac
@@ -574,13 +583,13 @@ case "$MODE" in
                 cfg=$(getprop sys.usb.config)
                 b=$(usb_read "$UDC_FILE"); [ "$b" != none ] || b=""
                 if [ "$(getprop init.svc.adbd)" != running ]; then
-                    usay "adbd is '$(getprop init.svc.adbd)': ctl.start adbd"
-                    setprop ctl.start adbd; fix=$n
+                    usay "adbd is '$(getprop init.svc.adbd)': ctl.start adbd$OFF"
+                    act setprop ctl.start adbd; fix=$n
                 elif ! usb_has_adb "$cfg"; then
-                    usay "adb is gone from the gadget (config '$cfg'): sys.usb.config $CFG again"
-                    setprop sys.usb.config "$CFG"; fix=$n
+                    usay "adb is gone from the gadget (config '$cfg'): sys.usb.config $CFG again$OFF"
+                    act setprop sys.usb.config "$CFG"; fix=$n
                 elif [ -n "$CTRL" ] && [ -n "$BOUND" ] && [ -z "$b" ]; then
-                    if echo "$CTRL" 2>/dev/null > "$UDC_FILE"; then usay "the gadget was unbound: UDC $CTRL written"
+                    if udc_put "$CTRL"; then usay "the gadget was unbound: UDC $CTRL written$OFF"
                     else usay "the gadget was unbound: UDC $CTRL could not be written (adbd's endpoints not ready yet?)"; fi
                     fix=$n
                 elif [ "$cable" = 1 ] && [ -n "$CTRL" ] && [ $tries -lt 2 ] && [ $((n - plug)) -ge 5 ]; then
@@ -588,14 +597,14 @@ case "$MODE" in
                     case "$st" in
                         "not attached"|attached|powered)
                             tries=$((tries + 1)); fix=$n
-                            usay "a cable is in for $(((n - plug) * EVERY)) s and UDC $CTRL is '$st': re-armed (sys.usb.config none, then $CFG; $tries of 2 for this plug-in)"
-                            setprop sys.usb.config none
+                            usay "a cable is in for $(((n - plug) * EVERY)) s and UDC $CTRL is '$st': re-armed (sys.usb.config none, then $CFG; $tries of 2 for this plug-in)$OFF"
+                            act setprop sys.usb.config none
                             sleep 1
-                            setprop sys.usb.config "$CFG"
+                            act setprop sys.usb.config "$CFG"
                             sleep 2
                             b=$(usb_read "$UDC_FILE"); [ "$b" != none ] || b=""
                             if [ -n "$BOUND" ] && [ -z "$b" ]; then
-                                if echo "$CTRL" 2>/dev/null > "$UDC_FILE"; then usay "UDC $CTRL written after the re-arm"
+                                if udc_put "$CTRL"; then usay "UDC $CTRL written after the re-arm$OFF"
                                 else usay "UDC $CTRL could not be written after the re-arm"; fi
                             fi ;;
                     esac

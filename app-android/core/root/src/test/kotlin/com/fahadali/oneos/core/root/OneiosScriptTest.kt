@@ -1114,6 +1114,8 @@ class OneiosScriptTest {
         for ((path, value) in listOf("config/usb_gadget/g1/UDC" to UDC, "sys/class/udc/$UDC/state" to "configured", "sys/class/power_supply/usb/online" to "1")) {
             f.file(path).apply { parentFile.mkdirs(); writeText("$value\n") }
         }
+        // The repairs are off unless the stage asks for them.
+        File(f.stage, "usb-repair").createNewFile()
     }
 
     /**

@@ -393,6 +393,14 @@ start runs `oneios_return.sh switch-failed` itself, and no longer only counts on
 gadget as One UI had it** (2026-11-13; OneiOS's `oneos/interface.md` section 6a is the same rule from the other
 side). **Not run on the phone yet.**
 
+**The repairs are off by default** until a phone session has shown them to be right: the record, the watcher's
+lines and the return's `usb:` lines always come, but the watcher and the return write nothing (each repair is
+logged with `(repairs are off: logged only; ...)`, the return says `usb: repairs are off ... nothing put back`)
+unless the stage has the file `usb-repair` at the switch (`su -c 'touch /data/local/tmp/oneios/usb-repair'`, or
+`ONEIOS_USB_REPAIR=1` for a switch by hand); the switch records it as `repair=1` in `control/base/usb`, which the
+watcher and the return go by. Remove the file to turn them off again. So with the default, a session is as
+before for USB: nothing of it is changed.
+
 Why: the USB gadget's functions are set by One UI's framework, UsbDeviceManager in system_server (through the USB
 gadget HAL or init's `sys.usb.config` triggers), on every plug-in and unplug. The switch stops system_server, so
 from then on nobody re-arms the gadget: whatever unbinds it or drops adb from it stays for the session. adbd and the
@@ -407,14 +415,14 @@ What the scripts do:
 1. **The switch's baseline** (`usb_save`, One UI whole) writes `control/base/usb`: `adb=` (1 when `sys.usb.config` or
    `persist.sys.usb.config` has adb, or `settings get global adb_enabled` is 1), `config=`, `state=`, `persist=`,
    `controller=` (`sys.usb.controller`, kept only when it is one path component), `udc=` (the gadget's UDC file,
-   `/config/usb_gadget/g1/UDC`), `adbd=` (`init.svc.adbd`), `configfs=`. `switch.log`: `USB of One UI: state ...,
+   `/config/usb_gadget/g1/UDC`), `adbd=` (`init.svc.adbd`), `configfs=`, `repair=` (1 with `usb-repair` in the stage). `switch.log`: `USB of One UI: state ...,
    config ..., UDC NAME STATE; bound '...', adbd ..., ffs.ready ..., cable ...; USB debugging on|off`.
 2. **After the framework's stop** (step 3), with USB debugging on, the **USB watcher** (`oneios_switch.sh
    --usb-watch`, `setsid`, init's mount namespace and the switch's root cgroup, never xnuhost's; a plain shell loop,
    no realtime thread; its pid in `control/usb-watch.pid`, its lines in `control/usb.log`) reads the gadget every 3 s
    (the properties `sys.usb.state`, `sys.usb.config`, `sys.usb.controller`, `sys.usb.ffs.ready`, `init.svc.adbd`
    and three named files: the UDC file, `/sys/class/udc/<controller>/state`, `/sys/class/power_supply/usb/online`)
-   and logs a line when it changed. At most one repair every 21 s, each only back to One UI's own value, in this
+   and logs a line when it changed. At most one repair every 21 s (with the repairs on; off, logged only), each only back to One UI's own value, in this
    order:
    - adbd not running: `setprop ctl.start adbd`;
    - adb gone from `sys.usb.config`: One UI's config again (`setprop sys.usb.config mtp,adb` on a phone that had
@@ -426,7 +434,7 @@ What the scripts do:
    With USB debugging off at the switch it is not started. It ends on `control/usb-watch.off` or when the state is
    `returning`, `returned` or `failed`. It is not part of the way back: nothing of the return waits for it.
 3. **The return** ends it in step 1 (`usb-watch.off`, then its pid, as the other helpers) and, in step 4 before One
-   UI's zygote starts, puts back what differs from `control/base/usb`: `sys.usb.config` (`setprop`, with its triggers,
+   UI's zygote starts and with the repairs on, puts back what differs from `control/base/usb`: `sys.usb.config` (`setprop`, with its triggers,
    then up to 3 s for `sys.usb.state` to follow), adbd (`ctl.start` when it ran at the switch) and the UDC file (One
    UI's controller, when it was bound at the switch and is empty now). `return.log`: `usb: before the restore: ...`,
    what was put back, `usb: after the restore: ...`; with no record, `usb: no record of the switch`. Logged only,
@@ -438,7 +446,8 @@ gadget's folder and `/sys/class/power_supply` are never listed. Nothing persist 
 STATE` at its start, on every change and at its stop: OneiOS `docs/booter.md` 2.9a). `control/usb.log` is not on
 the app's Session logs screen yet (`oneios_root.sh logs` is unchanged); `oneios-tool phone log --file usb` reads it.
 
-What the next session on the phone should bring back (with the cable plugged in during the session, and unplugged
+What the next sessions on the phone should bring back (one with the repairs off, the default, which shows what the
+gadget does with nothing re-arming it; then one with `usb-repair`; each with the cable plugged in during the session, and unplugged
 and plugged in again once): `oneios-tool phone log --file usb` (`control/usb.log`), `phone log --file switch`
 (its `USB of One UI:` line), `phone log --file return` (the `usb:` lines), `phone log --grep 'xnuhost I usb: '`,
 `control/base/usb`, and, with One UI back, `getprop sys.usb.config`, `sys.usb.state`, `persist.sys.usb.config`,

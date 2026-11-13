@@ -184,6 +184,11 @@ usb_restore() {
     ubound=$(sed -n 's/^udc=//p' "$U" | head -n 1)
     uadbd=$(sed -n 's/^adbd=//p' "$U" | head -n 1)
     say "usb: before the restore: $(usb_now)"
+    # Only with the repairs on (the switch recorded repair=1: $S/usb-repair); off, by default, logged only.
+    if [ "$(sed -n 's/^repair=//p' "$U" | head -n 1)" != 1 ]; then
+        say "usb: repairs are off (no $S/usb-repair at the switch): nothing put back; One UI's were config '$ucfg', adbd '$uadbd', UDC '$ubound'"
+        return 0
+    fi
     cur=$(getprop sys.usb.config)
     if [ -n "$ucfg" ] && [ "$cur" != "$ucfg" ]; then
         setprop sys.usb.config "$ucfg"
