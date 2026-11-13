@@ -17,7 +17,8 @@
 #   B  the stop loop is gone; One UI's boot counters are back; the display is
 #      One UI's again (the composer and surfaceflinger restarted, the boot
 #      animation); audioserver and the rest of zygote's restart list; the
-#      services One UI's framework waits for are registered; zygote starts.
+#      services One UI's framework waits for are registered; the USB gadget and
+#      adbd are One UI's again (control/base/usb); zygote starts.
 #   C  system_server keeps its pid until user 0 is unlocked and 20 s more.
 # Never ":" with a redirection in this script or in oneios_switch.sh: ":" is a
 # special builtin, and Android's sh (mksh) ends the whole script, without a
@@ -161,6 +162,50 @@ end_helper() { # <pid file> <mode word>
         is_ours "$p" "oneios_switch.sh $2" && kill -9 "$p" 2>/dev/null
     done
 }
+# The USB gadget and adbd back to One UI's (oneios_switch.sh, "USB AND ADB
+# DURING A SESSION": control/base/usb, recorded at the switch), before One UI's
+# zygote starts, so that its UsbDeviceManager finds them as it left them. Only
+# what differs, only One UI's values: sys.usb.config (with its triggers: init
+# or the HAL applies it), adbd, the gadget's UDC file. Named files and
+# properties only. Logged; never a reason for the failsafe.
+UDC_FILE="$T/config/usb_gadget/g1/UDC"
+usb_read() { head -c 64 "$1" 2>/dev/null | tr -d '\n'; }
+usb_name() { case "$1" in ''|.|..|*/*|*[!A-Za-z0-9._:-]*) echo "" ;; *) echo "$1" ;; esac; }
+usb_now() {
+    _uc=$(usb_name "$(getprop sys.usb.controller)")
+    _us=""; [ -z "$_uc" ] || _us=$(usb_read "$T/sys/class/udc/$_uc/state")
+    echo "state $(getprop sys.usb.state), config $(getprop sys.usb.config), UDC ${_uc:-?} ${_us:-?}; bound '$(usb_read "$UDC_FILE")', adbd $(getprop init.svc.adbd), ffs.ready $(getprop sys.usb.ffs.ready), cable $(usb_read "$T/sys/class/power_supply/usb/online")"
+}
+usb_restore() {
+    U="$BASE/usb"
+    [ -f "$U" ] || { say "usb: no record of the switch ($U): left as it is ($(usb_now))"; return 0; }
+    ucfg=$(sed -n 's/^config=//p' "$U" | head -n 1)
+    uctl=$(usb_name "$(sed -n 's/^controller=//p' "$U" | head -n 1)")
+    ubound=$(sed -n 's/^udc=//p' "$U" | head -n 1)
+    uadbd=$(sed -n 's/^adbd=//p' "$U" | head -n 1)
+    say "usb: before the restore: $(usb_now)"
+    cur=$(getprop sys.usb.config)
+    if [ -n "$ucfg" ] && [ "$cur" != "$ucfg" ]; then
+        setprop sys.usb.config "$ucfg"
+        say "usb: sys.usb.config $cur -> $ucfg (One UI's)"
+        un=0
+        while [ $un -lt 15 ] && [ "$(getprop sys.usb.state)" != "$ucfg" ]; do sleep 0.2; un=$((un + 1)); done
+    fi
+    ua=$(getprop init.svc.adbd)
+    if [ "$uadbd" = running ] && [ "$ua" != running ]; then
+        setprop ctl.start adbd
+        say "usb: adbd was '$ua': ctl.start adbd"
+    fi
+    if [ -n "$uctl" ] && [ "$ubound" = "$uctl" ]; then
+        b=$(usb_read "$UDC_FILE")
+        if [ -z "$b" ] || [ "$b" = none ]; then
+            if echo "$uctl" 2>/dev/null > "$UDC_FILE"; then say "usb: UDC $uctl written back"
+            else say "usb: UDC $uctl could not be written back (logged only)"; fi
+        fi
+    fi
+    say "usb: after the restore: $(usb_now)"
+    return 0
+}
 # The key readers lead process groups of their own (setsid): the reader, its
 # getevent and its timers end together. A reader that is not a group leader
 # has no such group, and is ended alone.
@@ -258,6 +303,12 @@ if [ "$WHO" = --guard ]; then
     echo "failsafe $(date +%s) the return did not finish within ${GUARD_MAX}s (last step: $(cat "$CTL/return.step" 2>/dev/null))" > "$S/return.outcome"
     do_reboot oneios-return-guard
 fi
+# The tests' way in (against a fake phone): the USB step of the return alone.
+if [ "$WHO" = --usb-restore ]; then
+    [ -n "$T" ] || { echo "oneios_return.sh --usb-restore: for the tests only"; exit 2; }
+    usb_restore
+    exit 0
+fi
 
 true >> "$LOG"
 say "=== Return to One UI ($WHO), session state '$(cat "$CTL/state" 2>/dev/null)', boot $(cat "$P/sys/kernel/random/boot_id" 2>/dev/null) ==="
@@ -343,6 +394,10 @@ bootui oneos_boot_write title 'Returning to One UI'
 # child, or the watcher itself).
 true 2>/dev/null > "$CTL/keys/session"
 end_readers
+# The session's USB watcher (it also ends by itself on this state); the USB
+# gadget goes back to One UI's in step 4.
+true 2>/dev/null > "$CTL/usb-watch.off"
+end_helper "$CTL/usb-watch.pid" --usb-watch
 wp=$(cat "$CTL/watcher.pid" 2>/dev/null)
 [ "$wp" = "$$" ] || [ "$wp" = "$PPID" ] || end_helper "$CTL/watcher.pid" --watch
 # The switch's inner shell, where it is still setting up xnuhost's namespace
@@ -650,6 +705,8 @@ done
 say "Gate B: display, audio and One UI's services up, SELinux $(getenforce 2>/dev/null)"
 
 step "[4/5] Starting One UI in place" 45
+# The USB gadget and adbd as One UI left them, before its UsbDeviceManager starts.
+usb_restore
 # zygote's onrestart by hand: abort the FUSE connections the old framework left.
 timeout 10 vdc volume abort_fuse >/dev/null 2>&1
 # One UI's zygote_next ran through the session with the old framework's

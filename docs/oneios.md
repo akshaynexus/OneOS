@@ -279,7 +279,7 @@ and neither kind of session starts while the other's stage has anything mounted.
 | `control/` | the way back's own: the session's state, the baseline, xnuhost's pid and namespace as the switch recorded them, the watcher's and key readers' pids, the return's lock and guard; `bootui/` (the boot screen's status files and pids) and `bootui.log` (the switch's lines about it). Read-only in xnuhost's namespace, like the two session scripts and `bin/` |
 | `logs/` | the five sessions before the last: `xnuhost-<epoch>.log`, moved there by the next switch (the epoch is that switch's time; the file's own time is its session's last line) |
 | `checks/` | the hardware checks' own: each check's last output (`<id>.log`), the camera pictures (`camera.png`, `camera-hal.png`), the values to put back (`saved.backlight`, `saved.als`), the tools' temporary files |
-| `switch.log`, `return.log`, `return.outcome` | the switch's output; the return's, the watcher's and the key readers'; how the last return ended. `control/display.log` and `control/watchdog_feeder.log` are the display helper's and the watchdog feeder's |
+| `switch.log`, `return.log`, `return.outcome` | the switch's output; the return's, the watcher's and the key readers'; how the last return ended. `control/display.log`, `control/watchdog_feeder.log` and `control/usb.log` are the display helper's, the watchdog feeder's and the USB watcher's ("USB and adb during a session") |
 
 ## Session flow
 
@@ -308,7 +308,7 @@ runtime with xnuhost is staged, this is where every switch ends.**
    `cpufreq_limit` cap. One UI (Samsung's SSRM in
    system_server) caps them when the phone is warm and its power HAL raises the floors in bursts; with
    system_server stopped, its last values stayed for the whole session (1.7-2.0 GHz CPUs and a 500 MHz GPU after a
-   warm One UI, the S24 Ultra, 2026-11-12). `switch.log`: `Clocks of One UI: ...`.
+   warm One UI, the S24 Ultra, 2026-11-12). `switch.log`: `Clocks of One UI: ...`. Also **One UI's USB gadget** (`control/base/usb`, "USB and adb during a session" below): `USB of One UI: ...`.
 2. The way back is armed first, each part in a session of its own (`setsid`) in init's mount namespace: the
    watcher, a `getevent` reader per volume-key device, and a poll of the keys' state. A kernel wakelock
    (`oneios_session`) keeps the phone awake without One UI's power manager. **One UI is not stopped unless all
@@ -320,7 +320,7 @@ runtime with xnuhost is staged, this is where every switch ends.**
    one line each in `switch.log`: `clocks: NODE OLD -> NEW (reads N)`. The kernel's thermal zones, trips and
    cooling devices are never written, nor anything under `/sys/power` but the wakelock: the kernel's junction
    trips, LMh and xnuhost's own thermal step (OneiOS `runtime/bridges/thermal`) are what cap a session.
-   Samsung's software watchdog gets its magic close and a feeder, as in an Android session.
+   Samsung's software watchdog gets its magic close and a feeder, as in an Android session. With USB debugging on, the USB watcher starts (below): adb stays on the USB gadget across unplug and replug.
 4. xnuhost starts in a **new mount namespace** in which the stage is bound over `/data`; `runtime`, `image`,
    `control`, `bin` and the two session scripts are read-only there. It gets a cgroup of its own
    (`/sys/fs/cgroup/oneios_session`) and `oom_score_adj` 500, so that it, not One UI's daemons or the way back,
@@ -346,7 +346,7 @@ runtime with xnuhost is staged, this is where every switch ends.**
    panel's brightness and, when the switch marked `clocks.set`, **One UI's clock caps** go back from the baseline,
    in the reverse order of the switch's writes: `clocks: NODE NOW -> OLD (One UI's)` in `return.log`, also after
    a SIGKILL of xnuhost (the return runs on every way back but the reboot, which resets them anyway). Only those
-   nodes and only numbers; a node that cannot be written is logged and does not stop the return.
+   nodes and only numbers; a node that cannot be written is logged and does not stop the return. The USB watcher ends here too.
 2. **Gate A.** No such process is left (a killed one that is still in the kernel gets up to 30 s of the gate's 45, killed again every second; each one is logged once with its `comm`, state and `wchan`, from its own `/proc/PID` files); the stage is mounted in no process's mount table (every namespace, not
    only init's: OneOS's run 45); nothing was mounted on One UI's partitions; the same boot; vold, keystore2 and
    servicemanager have their pids of the switch; the daemons One UI cannot restart are running; SELinux is as
@@ -357,7 +357,7 @@ runtime with xnuhost is staged, this is where every switch ends.**
    Then audioserver and the rest of zygote's restart list (cameraserver, media, wificond, and perfmond and
    media.tuner if they ran). Each must come back and register.
 4. **One UI's framework.** `vdc volume abort_fuse`, a fresh zygote_next, `ctl.restart netd` (whose own restart
-   list starts zygote; `ctl.start zygote` otherwise).
+   list starts zygote; `ctl.start zygote` otherwise). First the USB gadget and adbd go back to One UI's where they differ (`usb:` lines; "USB and adb during a session").
 5. **Gate C.** system_server keeps its pid until user 0 is unlocked and 20 s more, within 180 s.
 
 **Every step has a time limit of its own** (0.4.81), kept by the return's guard, a process of its own: 90 s to
@@ -386,6 +386,64 @@ takes the lock right after it writes `returning` (waiting up to 15 s for a stop 
 `control/stopped` is final and no switch stops One UI after it. "Nothing to restore" also needs One UI's zygote
 running; a state `returned` with the mark and the framework down is returned again. A switch whose xnuhost does not
 start runs `oneios_return.sh switch-failed` itself, and no longer only counts on a watcher that may have ended.
+
+## USB and adb during a session
+
+**The rule: adb over USB works for the whole iOS session, across unplug and replug, and the return leaves the USB
+gadget as One UI had it** (2026-11-13; OneiOS's `oneos/interface.md` section 6a is the same rule from the other
+side). **Not run on the phone yet.**
+
+Why: the USB gadget's functions are set by One UI's framework, UsbDeviceManager in system_server (through the USB
+gadget HAL or init's `sys.usb.config` triggers), on every plug-in and unplug. The switch stops system_server, so
+from then on nobody re-arms the gadget: whatever unbinds it or drops adb from it stays for the session. adbd and the
+UDC binding themselves outlive the framework (OneiOS's session of 2026-11-13 morning kept USB adb through the switch,
+the session and the return with the cable in from before the switch). On 2026-11-13 afternoon a cable plugged in
+during a session showed no USB device on the Mac at all; but the Mac had not seen the phone on USB before that
+switch either (it was staged over wireless adb), with One UI whole, so that session's missing USB came before the
+switch: the cable, the Mac's port, or a gadget state One UI already had (a guess until the lines below come back).
+
+What the scripts do:
+
+1. **The switch's baseline** (`usb_save`, One UI whole) writes `control/base/usb`: `adb=` (1 when `sys.usb.config` or
+   `persist.sys.usb.config` has adb, or `settings get global adb_enabled` is 1), `config=`, `state=`, `persist=`,
+   `controller=` (`sys.usb.controller`, kept only when it is one path component), `udc=` (the gadget's UDC file,
+   `/config/usb_gadget/g1/UDC`), `adbd=` (`init.svc.adbd`), `configfs=`. `switch.log`: `USB of One UI: state ...,
+   config ..., UDC NAME STATE; bound '...', adbd ..., ffs.ready ..., cable ...; USB debugging on|off`.
+2. **After the framework's stop** (step 3), with USB debugging on, the **USB watcher** (`oneios_switch.sh
+   --usb-watch`, `setsid`, init's mount namespace and the switch's root cgroup, never xnuhost's; a plain shell loop,
+   no realtime thread; its pid in `control/usb-watch.pid`, its lines in `control/usb.log`) reads the gadget every 3 s
+   (the properties `sys.usb.state`, `sys.usb.config`, `sys.usb.controller`, `sys.usb.ffs.ready`, `init.svc.adbd`
+   and three named files: the UDC file, `/sys/class/udc/<controller>/state`, `/sys/class/power_supply/usb/online`)
+   and logs a line when it changed. At most one repair every 21 s, each only back to One UI's own value, in this
+   order:
+   - adbd not running: `setprop ctl.start adbd`;
+   - adb gone from `sys.usb.config`: One UI's config again (`setprop sys.usb.config mtp,adb` on a phone that had
+     that);
+   - the UDC file empty (or `none`) while One UI had it bound: One UI's controller written into it;
+   - a cable in for 15 s with the UDC still `not attached`, `attached` or `powered`: re-armed, `sys.usb.config none`
+     then One UI's config (what OneOS's adb watchdog of the Android sessions does), and the UDC written again if it
+     stayed empty. Twice per plug-in at most, so a charger that never enumerates is left alone.
+   With USB debugging off at the switch it is not started. It ends on `control/usb-watch.off` or when the state is
+   `returning`, `returned` or `failed`. It is not part of the way back: nothing of the return waits for it.
+3. **The return** ends it in step 1 (`usb-watch.off`, then its pid, as the other helpers) and, in step 4 before One
+   UI's zygote starts, puts back what differs from `control/base/usb`: `sys.usb.config` (`setprop`, with its triggers,
+   then up to 3 s for `sys.usb.state` to follow), adbd (`ctl.start` when it ran at the switch) and the UDC file (One
+   UI's controller, when it was bound at the switch and is empty now). `return.log`: `usb: before the restore: ...`,
+   what was put back, `usb: after the restore: ...`; with no record, `usb: no record of the switch`. Logged only,
+   never a reason for the failsafe.
+
+Only properties and named files: the UDC is found by the name in `sys.usb.controller`, and `/sys/class/udc`, the
+gadget's folder and `/sys/class/power_supply` are never listed. Nothing persist is written, nothing under
+`/sys/power`, no input device is opened, no reboot. xnuhost logs the gadget too (`usb: state S, config C, UDC NAME
+STATE` at its start, on every change and at its stop: OneiOS `docs/booter.md` 2.9a). `control/usb.log` is not on
+the app's Session logs screen yet (`oneios_root.sh logs` is unchanged); `oneios-tool phone log --file usb` reads it.
+
+What the next session on the phone should bring back (with the cable plugged in during the session, and unplugged
+and plugged in again once): `oneios-tool phone log --file usb` (`control/usb.log`), `phone log --file switch`
+(its `USB of One UI:` line), `phone log --file return` (the `usb:` lines), `phone log --grep 'xnuhost I usb: '`,
+`control/base/usb`, and, with One UI back, `getprop sys.usb.config`, `sys.usb.state`, `persist.sys.usb.config`,
+`sys.usb.controller`, `sys.usb.configfs`, `sys.usb.ffs.ready`, `init.svc.adbd`, `cat /config/usb_gadget/g1/UDC` and
+`cat /sys/class/udc/$(getprop sys.usb.controller)/state`, and `logcat -d -b all | grep -iE 'UsbDeviceManager|usb_gadget|adbd'`.
 
 ## Boot screen
 
@@ -592,7 +650,14 @@ the two meet at the return's lock.
   script that cannot run; One UI's clock caps against a fake sysfs (`--clocks-save` and `--clocks-tops`, the
   switch's two steps run alone: the saved lines, the hardware's range written, then the return after a killed
   xnuhost writes One UI's values back before Gate A, leaves a thermal trip and any line that is not one of the nodes
-  alone, and writes no clock without the switch's mark); the return in place after SIGTERM and after SIGKILL of tasks in other namespaces,
+  alone, and writes no clock without the switch's mark); USB and adb (`--usb-save`, then a return that puts
+  `sys.usb.config`, adbd and the UDC file back before `ctl.restart netd`, one that sets nothing when nothing differs
+  or there is no record, and `--usb-watch` writing the UDC back on an unbound gadget, adb back into `sys.usb.config`,
+  and ending on `returning`: `oneUisUsbIsRecordedAndPutBackBeforeOneUisZygote`,
+  `aReturnLeavesAnUnchangedUsbGadgetAlone`, `theUsbWatcherKeepsAdbOnTheGadgetUntilTheReturn`; **not run on this
+  branch's box**, which has no JDK 21 or Android SDK: their steps were run by hand there against the same
+  `phone-tools.sh`, and OneiOS's stand-in phone, `tools/oneios-tool/tests/phone/usb.sh`, runs these scripts' USB
+  steps with unplug, replug, a re-arm and the return); the return in place after SIGTERM and after SIGKILL of tasks in other namespaces,
   with a surfaceflinger that died or outlived the composer; and a reboot for each failed check (a process that
   cannot be killed, a stage mount left anywhere, a mount on One UI's partitions, another vold, another SELinux
   mode, another boot, a zygote that started by itself, a composer, surfaceflinger or audioserver that does not
