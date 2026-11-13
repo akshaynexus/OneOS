@@ -1105,6 +1105,84 @@ class OneiosScriptTest {
         assertFalse(r.text, r.text.contains("clocks: "))
     }
 
+    /** One UI's USB gadget, as its framework set it: adb on, the UDC bound, a cable to a computer. */
+    private fun usbOfOneUi(f: Fake) {
+        f.file("props").appendText(
+            "sys.usb.config=mtp,adb\nsys.usb.state=mtp,adb\npersist.sys.usb.config=mtp,adb\nsys.usb.controller=$UDC\n" +
+                "sys.usb.configfs=1\nsys.usb.ffs.ready=1\ninit.svc.adbd=running\n",
+        )
+        for ((path, value) in listOf("config/usb_gadget/g1/UDC" to UDC, "sys/class/udc/$UDC/state" to "configured", "sys/class/power_supply/usb/online" to "1")) {
+            f.file(path).apply { parentFile.mkdirs(); writeText("$value\n") }
+        }
+        // The repairs are off unless the stage asks for them.
+        File(f.stage, "usb-repair").createNewFile()
+    }
+
+    /**
+     * USB and adb during a session (docs/oneios.md): the switch's record of One UI's USB, and the return puts back
+     * what differs (here as on a phone whose gadget HAL, not init, binds the UDC: the fake setprop only sets), before
+     * One UI's zygote.
+     */
+    @Test
+    fun oneUisUsbIsRecordedAndPutBackBeforeOneUisZygote() = each { f ->
+        f.phone()
+        usbOfOneUi(f)
+        val save = f.run("oneios_switch.sh", "--usb-save")
+        assertEquals(save.text, 0, save.exit)
+        assertTrue(save.text, save.text.contains("USB of One UI: state mtp,adb, config mtp,adb, UDC $UDC configured; bound '$UDC', adbd running") && save.text.contains("USB debugging on"))
+        val rec = File(f.control, "base/usb").readLines()
+        for (want in listOf("adb=1", "config=mtp,adb", "controller=$UDC", "udc=$UDC", "adbd=running")) assertTrue("$rec lacks $want", want in rec)
+        assertTrue(f.setprops.toString(), f.setprops.isEmpty())
+        // In the session adb went from the gadget, adbd stopped and the gadget was unbound.
+        f.file("props").appendText("sys.usb.config=adb\ninit.svc.adbd=stopped\n")
+        f.file("config/usb_gadget/g1/UDC").writeText("")
+        val r = f.returns()
+        assertEquals(r.text, 0, r.exit)
+        f.assertInPlace(r.text)
+        val log = f.setprops
+        val netd = log.indexOf("ctl.restart netd")
+        assertTrue("$log", log.indexOf("sys.usb.config mtp,adb") in 0 until netd && log.indexOf("ctl.start adbd") in 0 until netd)
+        assertEquals(UDC, f.file("config/usb_gadget/g1/UDC").readText().trim())
+        assertTrue(r.text, r.text.contains("usb: sys.usb.config adb -> mtp,adb (One UI's)") && r.text.contains("usb: UDC $UDC written back"))
+        assertTrue(r.text, r.text.indexOf("usb: before the restore: ") in r.text.indexOf("[4/5]") until r.text.indexOf("One UI's zygote started"))
+    }
+
+    /** A return with nothing of USB that differs sets no USB property; one with no record of the switch says so. */
+    @Test
+    fun aReturnLeavesAnUnchangedUsbGadgetAlone() = each { f ->
+        f.phone()
+        usbOfOneUi(f)
+        assertEquals(0, f.run("oneios_switch.sh", "--usb-save").exit)
+        val r = f.returns()
+        f.assertInPlace(r.text)
+        assertFalse(f.setprops.toString(), f.setprops.any { it.startsWith("sys.usb.") || it == "ctl.start adbd" })
+        assertTrue(r.text, r.text.contains("usb: after the restore: state mtp,adb, config mtp,adb, UDC $UDC configured"))
+        val g = Fake(f.sh).also { it.phone() }
+        val r2 = g.returns()
+        g.assertInPlace(r2.text)
+        assertTrue(r2.text, r2.text.contains("usb: no record of the switch"))
+    }
+
+    /**
+     * The session's USB watcher puts One UI's UDC back on a gadget that was unbound and adb back on one that lost it,
+     * and ends when the return begins.
+     */
+    @Test
+    fun theUsbWatcherKeepsAdbOnTheGadgetUntilTheReturn() = each { f ->
+        f.phone()
+        usbOfOneUi(f)
+        assertEquals(0, f.run("oneios_switch.sh", "--usb-save").exit)
+        val w = f.start("oneios_switch.sh", "--usb-watch", log = "log/usb-watch")
+        await("the watcher's first line") { f.lines("log/usb-watch").any { it.contains("usb: state mtp,adb") } }
+        f.file("config/usb_gadget/g1/UDC").writeText("")
+        await("the UDC written back") { f.file("config/usb_gadget/g1/UDC").readText().trim() == UDC }
+        f.file("props").appendText("sys.usb.config=mtp\n")
+        await("adb on the gadget again") { "sys.usb.config mtp,adb" in f.setprops }
+        File(f.control, "state").writeText("returning\n")
+        assertTrue(f.lines("log/usb-watch").toString(), w.waitFor(30, TimeUnit.SECONDS))
+        assertTrue(f.lines("log/usb-watch").toString(), f.lines("log/usb-watch").any { it.contains("the session is over: the watcher ends") })
+    }
+
     /** Where the composer's restart does not take surfaceflinger with it, surfaceflinger is restarted by name. */
     @Test
     fun aSurfaceflingerThatOutlivesTheComposerIsRestarted() = each { f ->
@@ -2274,6 +2352,9 @@ class OneiosScriptTest {
         const val GUEST_NS = "mnt:[77]"
         const val COMPOSER = "vendor.qti.hardware.display.composer"
         const val TOKEN = "4242.1700000000"
+
+        /** The S24 Ultra's USB controller (sys.usb.controller): a UDC name, as a guess until the phone's lines come. */
+        const val UDC = "a600000.dwc3"
 
         /** A 64-byte arm64 ELF header: "\u007fELF", 64-bit, e_machine 0xb7. */
         val ELF: ByteArray = ByteArray(64).also {

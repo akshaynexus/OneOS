@@ -15,6 +15,7 @@
 #   oneios_switch.sh --feed     (internal) Samsung's software watchdog feeder
 #   oneios_switch.sh --stop-loop (internal) keeps One UI's zygote stopped
 #   oneios_switch.sh --bootui   (internal) the boot screen's stage line, from xnuhost's log
+#   oneios_switch.sh --usb-watch (internal) keeps adb on the USB gadget through the session
 #
 # What a session never touches: One UI's /data beyond $STAGE (xnuhost's mount
 # namespace has the stage bound over /data), vold, keystore2, gatekeeper,
@@ -22,7 +23,9 @@
 # What it changes, all undone by oneios_return.sh or a reboot: One UI's zygote
 # (and zygote_secondary) stopped, the kernel wakelock oneios_session, Samsung's
 # software watchdog closed and fed, the cgroup oneios_session (xnuhost's own),
-# OneOS's boot screen on a surfaceflinger layer until the guest's first frame.
+# OneOS's boot screen on a surfaceflinger layer until the guest's first frame,
+# and, with USB debugging on, the USB watcher's repairs (sys.usb.config, adbd
+# and the gadget's UDC, each only back to One UI's own value).
 #
 # The ways back to One UI, none of which needs anything from the guest
 # (docs/oneios.md, "Getting back to One UI"):
@@ -478,6 +481,52 @@ clocks_tops() {
     [ ! -e "$k/thermal_pwrlevel" ] || echo "clocks: KGSL thermal_pwrlevel $(cat "$k/thermal_pwrlevel" 2>/dev/null), max_gpuclk $(cat "$k/max_gpuclk" 2>/dev/null)"
 }
 
+# --- USB AND ADB DURING A SESSION ---------------------------------------------
+# (docs/oneios.md, "USB and adb during a session"; OneiOS's oneos/interface.md.)
+# One UI's framework is what sets the USB gadget's functions: UsbDeviceManager in
+# system_server, through the USB gadget HAL or init's sys.usb.config triggers, on
+# every plug-in and unplug. The switch stops system_server, so for the whole
+# session nobody re-arms the gadget: whatever unbinds it, or drops adb from it,
+# stays (the S24 Ultra, 2026-11-13: a cable plugged in during the session, and
+# the Mac saw no USB device at all). usb_save records it while One UI is whole
+# (control/base/usb); the session's USB watcher (--usb-watch) keeps adb on it,
+# with One UI's own values only; the return puts back what differs.
+# Only named files and properties: sys.usb.controller names the UDC, and
+# /sys/class/udc is never listed. Nothing is written but sys.usb.config (One
+# UI's value), ctl.start adbd and the gadget's UDC file (One UI's controller).
+UDC_FILE="$T/config/usb_gadget/g1/UDC"
+usb_read() { head -c 64 "$1" 2>/dev/null | tr -d '\n'; }      # one named file, one line
+usb_name() { # a controller name that is one path component, else nothing
+    case "$1" in ''|.|..|*/*|*[!A-Za-z0-9._:-]*) echo "" ;; *) echo "$1" ;; esac
+}
+usb_has_adb() { case ",$1," in *,adb,*) return 0 ;; esac; return 1; }
+usb_now() { # the gadget as it is now, on one line
+    _uc=$(usb_name "$(getprop sys.usb.controller)")
+    _us=""; [ -z "$_uc" ] || _us=$(usb_read "$T/sys/class/udc/$_uc/state")
+    echo "state $(getprop sys.usb.state), config $(getprop sys.usb.config), UDC ${_uc:-?} ${_us:-?}; bound '$(usb_read "$UDC_FILE")', adbd $(getprop init.svc.adbd), ffs.ready $(getprop sys.usb.ffs.ready), cable $(usb_read "$T/sys/class/power_supply/usb/online")"
+}
+usb_save() {
+    _cfg=$(getprop sys.usb.config)
+    _adb=0
+    usb_has_adb "$_cfg" && _adb=1
+    usb_has_adb "$(getprop persist.sys.usb.config)" && _adb=1
+    [ "$(settings get global adb_enabled 2>/dev/null)" = 1 ] && _adb=1
+    {
+        echo "adb=$_adb"
+        echo "config=$_cfg"
+        echo "state=$(getprop sys.usb.state)"
+        echo "persist=$(getprop persist.sys.usb.config)"
+        echo "controller=$(usb_name "$(getprop sys.usb.controller)")"
+        echo "udc=$(usb_read "$UDC_FILE")"
+        echo "adbd=$(getprop init.svc.adbd)"
+        echo "configfs=$(getprop sys.usb.configfs)"
+        # The repairs of the USB watcher and the return: only with $STAGE/usb-repair (or ONEIOS_USB_REPAIR=1)
+        _rep=0; { [ -e "$STAGE/usb-repair" ] || [ "${ONEIOS_USB_REPAIR:-0}" = 1 ]; } && _rep=1
+        echo "repair=$_rep"
+    } > "$CTL/base/usb"
+    echo "USB of One UI: $(usb_now); USB debugging $([ $_adb = 1 ] && echo on || echo off)"
+}
+
 # --- INTERNAL MODES --------------------------------------------------------
 case "$MODE" in
     --clocks-save|--clocks-tops)
@@ -485,6 +534,85 @@ case "$MODE" in
         [ -n "$T" ] || { echo "$MODE: for the tests only"; exit 2; }
         mkdir -p "$CTL/base"
         if [ "$MODE" = --clocks-save ]; then clocks_save; else clocks_tops; fi
+        exit 0 ;;
+    --usb-save)
+        # The tests' way in (against a fake phone): the step the session takes at its baseline.
+        [ -n "$T" ] || { echo "$MODE: for the tests only"; exit 2; }
+        mkdir -p "$CTL/base"
+        usb_save
+        exit 0 ;;
+    --usb-watch)
+        # The session's USB watcher, started once One UI's framework is stopped
+        # (above, "USB AND ADB DURING A SESSION"); its lines go to control/usb.log.
+        # Every 3 s it reads the gadget and logs it when it changed; at most one
+        # repair every 21 s, in this order: adbd not running (ctl.start adbd); adb
+        # gone from sys.usb.config (One UI's value again); the UDC file empty while
+        # One UI had it bound (One UI's controller written); a cable in for 15 s
+        # with the UDC still "not attached", "attached" or "powered" (sys.usb.config
+        # none, then One UI's: init or the HAL binds it again; twice per plug-in at
+        # most, so a charger that never enumerates is left alone). Not with USB
+        # debugging off at the switch. Ends on control/usb-watch.off, or when the
+        # session is over. Not the way back: nothing of the return waits for it.
+        echo $$ > "$CTL/usb-watch.pid"
+        U="$CTL/base/usb"
+        usay() { echo "$(date '+%F %T') usb: $*"; }
+        [ "$(conf "$U" adb)" = 1 ] || { usay "One UI had USB debugging off at the switch (or no $U): nothing to keep"; exit 0; }
+        CFG=$(conf "$U" config)
+        usb_has_adb "$CFG" || CFG=$(conf "$U" persist)
+        usb_has_adb "$CFG" || CFG=adb
+        CTRL=$(usb_name "$(conf "$U" controller)")
+        BOUND=$(conf "$U" udc)
+        [ "$BOUND" != none ] || BOUND=""
+        EVERY=3
+        # Repairs only where the stage asks for them (usb-repair, recorded at the switch as repair=1): not run on the
+        # phone yet, so off by default; off, every repair is logged and nothing is written.
+        REPAIR=$(conf "$U" repair)
+        OFF=""; [ "$REPAIR" = 1 ] || OFF=" (repairs are off: logged only; $STAGE/usb-repair turns them on)"
+        act() { [ "$REPAIR" = 1 ] || return 0; "$@"; }
+        udc_put() { [ "$REPAIR" = 1 ] || return 0; echo "$1" 2>/dev/null > "$UDC_FILE"; }
+        usay "watching every ${EVERY} s: keeps config $CFG, adbd and UDC ${CTRL:-?} (bound '${BOUND}' at the switch), repairs $([ "$REPAIR" = 1 ] && echo on || echo off)"
+        last=""; n=0; fix=-100; plug=0; tries=0; cable0=""
+        while [ ! -e "$CTL/usb-watch.off" ]; do
+            case "$(cat "$CTL/state" 2>/dev/null)" in returning|returned|failed) usay "the session is over: the watcher ends"; exit 0 ;; esac
+            now=$(usb_now)
+            [ "$now" = "$last" ] || { usay "$now"; last=$now; }
+            cable=$(usb_read "$T/sys/class/power_supply/usb/online")
+            if [ "$cable" = 1 ] && [ "$cable0" != 1 ]; then plug=$n; tries=0; fi
+            cable0=$cable
+            if [ $((n - fix)) -ge 7 ]; then
+                cfg=$(getprop sys.usb.config)
+                b=$(usb_read "$UDC_FILE"); [ "$b" != none ] || b=""
+                if [ "$(getprop init.svc.adbd)" != running ]; then
+                    usay "adbd is '$(getprop init.svc.adbd)': ctl.start adbd$OFF"
+                    act setprop ctl.start adbd; fix=$n
+                elif ! usb_has_adb "$cfg"; then
+                    usay "adb is gone from the gadget (config '$cfg'): sys.usb.config $CFG again$OFF"
+                    act setprop sys.usb.config "$CFG"; fix=$n
+                elif [ -n "$CTRL" ] && [ -n "$BOUND" ] && [ -z "$b" ]; then
+                    if udc_put "$CTRL"; then usay "the gadget was unbound: UDC $CTRL written$OFF"
+                    else usay "the gadget was unbound: UDC $CTRL could not be written (adbd's endpoints not ready yet?)"; fi
+                    fix=$n
+                elif [ "$cable" = 1 ] && [ -n "$CTRL" ] && [ $tries -lt 2 ] && [ $((n - plug)) -ge 5 ]; then
+                    st=$(usb_read "$T/sys/class/udc/$CTRL/state")
+                    case "$st" in
+                        "not attached"|attached|powered)
+                            tries=$((tries + 1)); fix=$n
+                            usay "a cable is in for $(((n - plug) * EVERY)) s and UDC $CTRL is '$st': re-armed (sys.usb.config none, then $CFG; $tries of 2 for this plug-in)$OFF"
+                            act setprop sys.usb.config none
+                            sleep 1
+                            act setprop sys.usb.config "$CFG"
+                            sleep 2
+                            b=$(usb_read "$UDC_FILE"); [ "$b" != none ] || b=""
+                            if [ -n "$BOUND" ] && [ -z "$b" ]; then
+                                if udc_put "$CTRL"; then usay "UDC $CTRL written after the re-arm$OFF"
+                                else usay "UDC $CTRL could not be written after the re-arm"; fi
+                            fi ;;
+                    esac
+                fi
+            fi
+            sleep $EVERY; n=$((n + 1))
+        done
+        usay "ended (control/usb-watch.off)"
         exit 0 ;;
     --inner)
         # Inside the new mount namespace (unshare -m), still root. The stage
@@ -979,6 +1107,9 @@ for bl in "$T"/sys/class/backlight/*/brightness; do
     [ -f "$bl" ] && echo "${bl#"$T"} $(cat "$bl" 2>/dev/null)"
 done > "$B/backlight" 2>/dev/null
 clocks_save
+# The USB gadget and adbd as One UI has them (control/base/usb), for the
+# session's USB watcher and the return.
+usb_save
 echo "Baseline: boot $(cat "$B/boot_id"), SELinux $(cat "$B/selinux"), $(tr '\n' ' ' < "$B/pids")wifi $(cat "$B/wifi_on")"
 
 echo "=== [2/5] $(date +%T) Arming the way back ==="
@@ -1077,6 +1208,14 @@ rmdir "$CTL/stop.lock" 2>/dev/null
 clocks_tops
 "$BB" setsid /system/bin/sh "$SELF" --stop-loop </dev/null >/dev/null 2>&1 &
 echo $! > "$CTL/stop-loop.pid"
+# UsbDeviceManager went with system_server: from here the USB watcher keeps
+# adb on the gadget, across unplug and replug (control/usb.log).
+if [ "$(conf "$CTL/base/usb" adb)" = 1 ]; then
+    "$BB" setsid /system/bin/sh "$SELF" --usb-watch </dev/null >>"$CTL/usb.log" 2>&1 &
+    echo "USB watcher: started (log $CTL/usb.log)"
+else
+    echo "USB watcher: not started (USB debugging was off in One UI)"
+fi
 # Samsung's software watchdog: its magic close now, then the feeder.
 for wd in /dev/watchdog /dev/softdog $(cat "$CTL/softdog_nodes"); do
     [ -c "$wd" ] || continue
