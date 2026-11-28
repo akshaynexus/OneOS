@@ -148,12 +148,12 @@ class OneiosActivity : EdgeToEdgeActivity() {
         val newShape = listOf(
             steps.steps.map { listOf(it.state, it.line, it.reason, it.cancel, it.log, it.progress == null) }, steps.next,
             st, s.job, s.waitingFor != null, s.offered, s.failure, s.last, s.flow.problem, t.busy, t.builtKc,
-            OneiosConfJob.state.writing, OneiosJob.kernelCheckLine(this),
+            OneiosConfJob.state.writing, OneiosJob.kernelCheckLine(this), input.expectedKernel,
             avail, AppUpdater.state.phase, logsState.exporting,
         )
         if (newShape != shape) {
             shape = newShape
-            build(s, steps, avail)
+            build(s, steps, avail, input.expectedKernel)
             invalidateOptionsMenu()
         } else {
             for (step in steps.steps) rows[step.id]?.let { bindStep(it, step) }
@@ -174,7 +174,7 @@ class OneiosActivity : EdgeToEdgeActivity() {
         else -> ""
     }
 
-    private fun build(s: OneiosJob.State, steps: OneiosSteps.View, avail: OneiosUpdates.Available) {
+    private fun build(s: OneiosJob.State, steps: OneiosSteps.View, avail: OneiosUpdates.Available, expectedKernel: String?) {
         val column = findViewById<LinearLayout>(R.id.oneios_column)
         column.removeAllViews()
         rows.clear()
@@ -221,7 +221,7 @@ class OneiosActivity : EdgeToEdgeActivity() {
         PrebootCards.row(state, getString(R.string.oneios_page_image), flow.imageLine ?: getString(R.string.oneios_page_none))
         if (st?.runtime != null && st.image != null) {
             val image = st.imageKernel?.buildId ?: getString(R.string.oneios_kernel_kc_unknown)
-            val runtime = st.runtimeKernel?.buildId ?: getString(R.string.oneios_kernel_kc_none)
+            val runtime = expectedKernel ?: st.runtimeKernel?.buildId ?: getString(R.string.oneios_kernel_kc_none)
             val line = listOfNotNull(
                 getString(R.string.oneios_page_kernel_line, image, runtime),
                 getString(R.string.oneios_page_kernel_fallback).takeIf { st.imageKernel?.hasFallback == true },

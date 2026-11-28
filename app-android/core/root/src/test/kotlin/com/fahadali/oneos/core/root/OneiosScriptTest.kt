@@ -571,6 +571,67 @@ class OneiosScriptTest {
     }
 
     /**
+     * OneiOS issue 86: `finish kernel` used basic-regex `grep -v '^kernel_build_id=\|^kernel_kc_sha256='`, which
+     * Android's toybox grep does not alternate on, so every second kernel update kept the old `kernel_build_id=`
+     * above the new one and `status` (`conf` with `head -n 1`) kept reporting the old kernel forever. Now `finish
+     * kernel` strips prior keys with `awk` (no `\|` in `oneios_root.sh`), and `conf`/`restore` read the last line so
+     * phones with already-duplicated `image.conf` files recover immediately on `status`.
+     */
+    @Test
+    fun aSecondKernelUpdateReplacesKernelBuildIdInImageConfAndHealsDuplicates() = each { f ->
+        val scriptText = File(Shipped.fullAssets, "root/oneios_root.sh").readText()
+        assertFalse(
+            "oneios_root.sh must not use basic-regex \\| with grep (toybox ignores it)",
+            scriptText.lines().any { l -> !l.trimStart().startsWith("#") && l.contains("grep ") && l.contains("\\|") },
+        )
+        val bid1 = "xnu-12377.121.6-ios-27.0.1-24A446-111111111111"
+        val bid2 = "xnu-12377.121.6-ios-27.0.1-24A446-222222222222"
+        val xnu = ByteArray(100) { it.toByte() }
+        val xnuSha = Hashes.sha256(xnu)
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("runtime")))
+        assertOk(f.receive("runtime", "runtime.json", "{}".toByteArray()))
+        assertOk(f.receive("runtime", "kernel/xnu.macho", xnu, "0644"))
+        assertOk(f.receive("runtime", "bin/xnuhost", ELF, "0755"))
+        assertOk(f.verb(OneiosRoot.Verb.FINISH, listOf("runtime", "3", "0.1.45", "1", "bin/xnuhost", "1", "0", bid2, xnuSha, "xnu-12377.121.6")))
+        val kc1 = ByteArray(5000) { (it % 251).toByte() }
+        val kc1Sha = Hashes.sha256(kc1)
+        assertOk(f.verb(OneiosRoot.Verb.BEGIN, listOf("image")))
+        assertOk(f.receive("image", "manifest.json", manifestWithKc(kc1.size, kc1Sha)))
+        assertOk(f.receive("image", "kernel.kc", kc1, "0644"))
+        assertOk(f.receive("image", "kernel.kc.hashes", "hashes-1".toByteArray(), "0644"))
+        assertOk(f.receive("image", "os.img", ByteArray(100)))
+        assertOk(f.verb(OneiosRoot.Verb.FINISH, listOf("image", "4", "1", "27.0.1", "24A446")))
+        kbInputs(f)
+        val kcIn = ByteArray(300) { (it * 3).toByte() }
+        val kcInSha = Hashes.sha256(kcIn)
+        assertOk(f.verb(OneiosRoot.Verb.KBINPUT, listOf("kernelcache.macho", kcIn.size.toString(), kcInSha), kcIn))
+
+        // First activation: writes bid1.
+        val kc2 = ByteArray(6000) { (it % 247).toByte() }
+        val kc2Sha = Hashes.sha256(kc2)
+        makeKernelOut(f, kc2, xnuSha, kcInSha)
+        assertOk(f.verb(OneiosRoot.Verb.FINISH, listOf("kernel", kc2Sha, bid1)))
+
+        // Simulate a phone already stuck from 0.5.98/0.5.99 with duplicate kernel_build_id lines in image.conf:
+        // status immediately reads the latest (last) entry.
+        val imageConf = File(f.stage, "image.conf")
+        imageConf.appendText("kernel_build_id=$bid2\nkernel_kc_sha256=${"c".repeat(64)}\n")
+        assertEquals(bid2, f.verb(OneiosRoot.Verb.STATUS).status.imageKernel!!.buildId)
+
+        // Second activation: strips all prior kernel_build_id / kernel_kc_sha256 lines and writes exactly one pair.
+        val kc3 = ByteArray(6100) { (it % 241).toByte() }
+        val kc3Sha = Hashes.sha256(kc3)
+        makeKernelOut(f, kc3, xnuSha, kcInSha)
+        assertOk(f.verb(OneiosRoot.Verb.FINISH, listOf("kernel", kc3Sha, bid2)))
+        val lines = imageConf.readLines()
+        assertEquals(listOf("kernel_build_id=$bid2"), lines.filter { it.startsWith("kernel_build_id=") })
+        assertEquals(listOf("kernel_kc_sha256=$kc3Sha"), lines.filter { it.startsWith("kernel_kc_sha256=") })
+        val st = f.verb(OneiosRoot.Verb.STATUS).status
+        assertEquals(bid2, st.imageKernel!!.buildId)
+        assertEquals(kc3Sha, st.imageKernel.kcSha256)
+    }
+
+    /**
      * The Galaxy A56's GPU addon in Update the kernel (docs/oneios.md, "Kernel updates"): for an iOS 16.5 (20F66)
      * set, `finish kernel` runs the staged runtime's `oneios-tool image a56-gpu-place` after the kernel is
      * activated, and moves its kernel.kc.gpuaddon, owner-trust.json and manifest.json in with image.sha256 and

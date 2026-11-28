@@ -183,7 +183,7 @@ own() { # <path> <mode>
     { [ -n "$T" ] || chown 0:0 "$1"; } && chmod "$2" "$1"
 }
 boot_id() { cat "$T/proc/sys/kernel/random/boot_id" 2>/dev/null; }
-conf() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+conf() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1; }
 find_bb() {
     BB=""
     for c in /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox /data/adb/magisk/busybox; do
@@ -978,7 +978,9 @@ do_finish_kernel() {
     why=$(kc_activate "$out" "$kc" "$bid") || die "$why"
     ic="$STAGE/image.conf"
     {
-        grep -v '^kernel_build_id=\|^kernel_kc_sha256=' "$ic"
+        # awk, never basic-regex grep '\|': Android's toybox grep does not alternate on \|, which left the old
+        # kernel_build_id line above the new one so status kept reading the old kernel (OneiOS issue 86).
+        awk -F= '$1 != "kernel_build_id" && $1 != "kernel_kc_sha256"' "$ic"
         echo "kernel_build_id=$bid"
         echo "kernel_kc_sha256=$kc"
     } > "$ic.new" && own "$ic.new" 0600 && mv -f "$ic.new" "$ic" || die "could not write image.conf"
@@ -1003,7 +1005,7 @@ do_restore_kernel() {
     done
     kc=$(awk '$2 == "kernel.kc" { print $1 }' "$prev/image.sha256" 2>/dev/null | head -n 1)
     is_hex64 "$kc" || refuse "the kept set names no kernel.kc: stage the image set again"
-    bid=$(awk -F= '$1 == "kernel_build_id" { print $2 }' "$prev/image.conf" 2>/dev/null | head -n 1)
+    bid=$(awk -F= '$1 == "kernel_build_id" { print $2 }' "$prev/image.conf" 2>/dev/null | tail -n 1)
     case "$bid" in ''|-*|*[!A-Za-z0-9._-]*) bid="unknown" ;; esac
     [ "$(sha "$prev/kernel.kc")" = "$kc" ] || refuse "the kept kernel.kc does not match its list: stage the image set again"
     for f in kernel.kc.hashes manifest.json; do

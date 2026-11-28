@@ -108,6 +108,14 @@ or opened on a device yet.
    `OneiosActivity`): one tap builds and shares a zip bundling `xnuhost.log`, switch/return/display/feeder logs,
    best-effort iOS last-boot unified log (`oneios-tool serve ioslog-show`), `summary.txt`, and versions, plus a
    one-tap "Copy GitHub issue text" button (versions + session summary; no personal data or Apple files).
+5. **Fix repeated kernel update loop** (OneiOS issue 86, `oneios_root.sh`, `OneiosActivity`): `do_finish_kernel` used
+   basic-regex `grep -v '^kernel_build_id=\|^kernel_kc_sha256='`, which Android's toybox `grep` does not alternate on,
+   leaving the old `kernel_build_id=` above the new one so `conf` (`head -n 1`) kept reporting the old kernel after
+   activation. `do_finish_kernel` now filters prior keys with `awk`, and `conf`/`do_restore_kernel` read the last
+   matching line (`tail -n 1`) so phones with already-duplicated `image.conf` entries recover immediately on `status`.
+   `OneiosActivity` also shows the staged image build's expected runtime kernel on the Kernel row (matching
+   `OneiosLogsActivity` for `24B156`). Host-tested (`OneiosScriptTest.aSecondKernelUpdateReplacesKernelBuildIdInImageConfAndHealsDuplicates`);
+   not yet booted on a phone.
 
 ## Where its pieces come from
 
